@@ -107,6 +107,9 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
+# a CPU without the ready-made engine compiles it with its own CUDA toolkit: 12.x runs on 525+ (minor-version
+# compatibility), and ppc64le's last driver is 550 (CUDA 12.4)
+MIN_DRIVER_LOCAL = 525
 MIN_ENGINE = (0, 1, 32)                # v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (#214)
@@ -924,6 +927,26 @@ def _installed(name: str) -> bool:
         return False
 
 
+def pkg_config_this_python() -> None:
+    """A package without a wheel for this CPU (numpy, pyyaml, pillow, ... on ppc64le) is compiled, and numpy's build
+    finds Python through pkg-config's `python3`.  On RHEL / Rocky / Alma that is the system's python3 (3.6 on 8), not
+    the newer Python this venv runs on, and numpy's Cython check then fails against the old headers.  This Python's
+    own python-X.Y.pc goes first on PKG_CONFIG_PATH as python3.pc."""
+    ver = "%d.%d" % sys.version_info[:2]
+    if WIN or out(["pkg-config", "--modversion", "python3"]).strip() in ("", ver):
+        return
+    pcdir = out(["pkg-config", "--variable=pcfiledir", f"python-{ver}"]).strip()
+    if not pcdir or not (Path(pcdir) / f"python-{ver}.pc").exists():
+        return
+    d = Path(sys.prefix) / "pkgconfig"
+    d.mkdir(exist_ok=True)
+    link = d / "python3.pc"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(Path(pcdir) / f"python-{ver}.pc")
+    os.environ["PKG_CONFIG_PATH"] = os.pathsep.join(filter(None, [str(d), os.environ.get("PKG_CONFIG_PATH")]))
+
+
 def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
     requirements (#214) recorded bare names: those packages are kept as they are (nothing is reinstalled), and the
@@ -937,6 +960,7 @@ def pip_install(packages, what):
         ok(f"{what} already installed")
         return
     say(f"  Installing {what} ...")
+    pkg_config_this_python()
     run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need])
     stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
     ok(f"{what} installed")
@@ -2355,8 +2379,9 @@ def main() -> int:
         if multi:
             ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
         ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {cc(gpu)}, driver {gpu['driver']}")
-        if driver_major(gpu) < MIN_DRIVER:
-            fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
+        min_driver = MIN_DRIVER if X86 else MIN_DRIVER_LOCAL
+        if driver_major(gpu) < min_driver:
+            fail(f"the NVIDIA driver is too old ({gpu['driver']}; {min_driver} or newer is needed)",
                  "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")

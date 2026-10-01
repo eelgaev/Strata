@@ -846,6 +846,11 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   endif()
+  # POWER: ggml-cpu's VSX code spells the AltiVec types `vector float`, a GNU keyword that the strict -std=c++17 this
+  # project's CMAKE_CXX_EXTENSIONS OFF gives the subdirectory turns off; upstream llama.cpp builds it as gnu++17
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc|powerpc)")
+    set_target_properties(ggml-cpu PROPERTIES CXX_EXTENSIONS ON)
+  endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)

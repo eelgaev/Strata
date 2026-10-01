@@ -168,6 +168,7 @@ class Main(unittest.TestCase):
             mock.patch.object(setup, "ram_gb", lambda: ram),
             mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, True)),
             mock.patch.object(setup, "ARM", False),   # an x86 PC, whatever runs the test
+            mock.patch.object(setup, "X86", True),
             mock.patch.object(setup, "page_file_gb", lambda: 16.0),
             mock.patch.object(setup, "free_gb", lambda p: 500.0),
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),

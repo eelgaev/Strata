@@ -53,6 +53,9 @@ ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
 # aarch64 (NVIDIA DGX Spark / GB10, Grace): no ready-made engine; compiled here with ggml's CPU flags spelled out
 ARM = platform.machine().lower() in ("aarch64", "arm64")
+# x86-64 is the only CPU with the AVX kernels and the ready-made engine; every other one (aarch64, ppc64le) compiles
+# the engine here, with src/kernels/cpu/portable.cpp and ggml-cpu's own SIMD (NEON, VSX) for the CPU side
+X86 = platform.machine().lower() in ("x86_64", "amd64", "i386", "i686", "x86")
 
 
 def arm_cpu_arch() -> str:
@@ -1421,6 +1424,9 @@ def install_build_tools(gpu, yes):
         if nvcc is None or cuda_v < need_cuda:
             osr = dict(line.split("=", 1) for line in open("/etc/os-release").read().splitlines() if "=" in line)
             ver = osr.get("VERSION_ID", "").strip('"').replace(".", "")
+            if not X86 and not ARM:   # ppc64le: NVIDIA's last toolkit for it is CUDA 12.4, not in these repositories
+                fail(f"the CUDA Toolkit is installed automatically on x86-64 and aarch64 only, not {platform.machine()}",
+                     "install CUDA 12 from https://developer.nvidia.com/cuda-toolkit-archive and run it again")
             if osr.get("ID") != "ubuntu" or ver not in ("2204", "2404"):
                 fail("the CUDA Toolkit can be installed automatically on Ubuntu 22.04 / 24.04 only",
                      "install it from https://developer.nvidia.com/cuda-downloads and run it again")
@@ -2371,8 +2377,8 @@ def main() -> int:
         warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
              "the model may not start or may use less VRAM. Set it to \"System managed\": System > About > "
              "Advanced system settings > Performance > Advanced > Virtual memory")
-    ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
-    if not avx2 and not ARM:   # aarch64: ggml-cpu's NEON kernels instead (compiled here, see arm_cpu_arch)
+    ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})" if X86 else f"CPU: {cpu} ({platform.machine()})")
+    if not avx2 and X86:   # other CPUs: ggml-cpu's NEON / VSX kernels instead (compiled here)
         fail("this CPU has no AVX2; Strata needs at least AVX2")
     if a.check:
         say()
@@ -2598,7 +2604,7 @@ def main() -> int:
     step(4, "the Strata engine")
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    eng = None if a.build or hip or ARM else get_prebuilt(a.prebuilt, gpu, vision)   # the release is x86-64
+    eng = None if a.build or hip or not X86 else get_prebuilt(a.prebuilt, gpu, vision)   # the release is x86-64
     if eng is not None and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
         pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
         if vision != "none" and not (eng / VEXE).exists():

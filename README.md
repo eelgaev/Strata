@@ -98,6 +98,10 @@ RX 7800 XT / 7700 XT and RX 9060 XT were validated by their owners; the RX 6800 
 `./setup.sh --backend hip`, chosen by itself on a PC with no NVIDIA card Strata can use. It installs ROCm without sudo
 and compiles the engine (no images yet; several cards with `--gpus`). Details: [AMD HIP](docs/AMD_HIP.md).
 
+An **NVIDIA DGX Spark** (GB10, ARM) works too (experimental; tested with IQ2_XS and UD-Q4_K_XL): `./setup.sh` compiles the engine
+there, and every expert fits on its GPU (decode 55-62 tok/s, prefill 928-1,515 tok/s). Details:
+[DGX Spark](docs/DGX_SPARK.md).
+
 ## Install
 
 **You need:** an NVIDIA RTX 20, 30, 40 or 50 card with 12 GB of VRAM or more (RTX 20 since 0.1.27), enough RAM for the size you pick (above;

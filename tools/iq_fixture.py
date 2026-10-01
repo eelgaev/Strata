@@ -1,6 +1,6 @@
 """tools/iq_fixture.py - deterministic i-quant fixtures for src/kernels/iq_parity.cpp (TODO 24).
 
-For each of the ten types iq_parity tests, writes `<out>/<name>.bin` (int32 header: the KERNEL type id,
+For each of the eleven types iq_parity tests, writes `<out>/<name>.bin` (int32 header: the KERNEL type id,
 rows, cols - then the raw GGUF block bytes) and `<out>/<name>.f32` (rows*cols float32 reference values,
 dequantized by the same library the comparison treats as ground truth):
 
@@ -50,7 +50,7 @@ QT = gguf.GGMLQuantizationType
 # name -> (block values, block bytes, the fp16 scale offsets inside a block).  The layouts mirror
 # gguf-py's dequantize_blocks implementations: every one of these formats keeps its half-precision
 # scale(s) at fixed offsets (IQ*_X*: offset 0; Q3_K: after the 32-byte hmask, 64-byte qs and the
-# 12 scale bytes) - the rest of the block is indices and sub-scales, which are seeded random bytes.
+# 12 scale bytes; Q6_K: last, after ql, qh and the 16 int8 scales) - the rest of the block is indices and sub-scales, which are seeded random bytes.
 LAYOUT = {   # (block values, block bytes) == the vendored gguf-py's GGML_QUANT_SIZES == the kernels' sizes
     "IQ2_XXS": (256,  66),
     "IQ2_XS":  (256,  74),
@@ -61,6 +61,7 @@ LAYOUT = {   # (block values, block bytes) == the vendored gguf-py's GGML_QUANT_
     "IQ4_NL":   (32,  18),
     "IQ4_XS":  (256, 136),
     "Q3_K":    (256, 110),
+    "Q6_K":    (256, 210),
 }
 HALF_ONE = struct.pack("<e", 1.0)      # fp16 1.0 = 0x3c00: a tame, exactly-representable scale
 
@@ -75,6 +76,9 @@ def repair_scales(name: str, raw: np.ndarray) -> None:
     if name == "Q3_K":
         raw[:, 108:110] = np.frombuffer(HALF_ONE, dtype=np.uint8)
         return
+    if name == "Q6_K":                             # ql[128] qh[64] scales[16], then the fp16 d
+        raw[:, 208:210] = np.frombuffer(HALF_ONE, dtype=np.uint8)
+        return
     if name == "IQ1_M":
         raw[:, 48:56] &= np.uint8(0x0F)            # clear the four scale nibbles
         for byte, nib in ((49, 0x30), (51, 0xC0), (54, 0x00), (55, 0x00)):
@@ -83,7 +87,8 @@ def repair_scales(name: str, raw: np.ndarray) -> None:
     raw[:, 0:2] = np.frombuffer(HALF_ONE, dtype=np.uint8)
 # name -> (the KERNEL type id written into the .bin header, identical to the gguf-py enum id)
 KERNEL_IDS = {"IQ2_XXS": 16, "IQ2_XS": 17, "IQ2_S": 22, "IQ3_XXS": 18, "IQ3_S": 21,
-              "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11}
+              "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11,
+              "Q6_K": 14}
 
 
 def build(name: str, rows: int, cols: int, seed: int):

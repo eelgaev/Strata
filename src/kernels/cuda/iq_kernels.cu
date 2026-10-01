@@ -1218,6 +1218,22 @@ __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>((float) x[ib].qs[8 * il + j] * d);
 }
 
+// Q6_K (Unsloth's token_embd): ggml's dequantize_row_q6_K.  Thread tid takes values 8 tid .. 8 tid + 7, which lie in
+// one 32-value segment k of one 128-value half: ql nibble 4 (k >> 1) of byte 32 (k & 1) + l, qh bits 2k, scale 2k + l/16.
+template<typename dst_t>
+__device__ void dq_q6_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q6_K* x = (const block_q6_K*) vx + ibs;
+    const float d = __half2float(x->d);
+    const int n0 = 8 * tid, ip = n0 / 128, k = (n0 % 128) / 32, l0 = n0 % 32;
+    const uint8_t* ql = x->ql + 64 * ip + 32 * (k & 1);
+    const uint8_t* qh = x->qh + 32 * ip;
+    for (int j = 0; j < 8; ++j) {
+        const int l = l0 + j;
+        const int q = (((ql[l] >> (4 * (k >> 1))) & 0xF) | (((qh[l] >> (2 * k)) & 3) << 4)) - 32;
+        yy[n0 + j] = cvt<dst_t>(d * (float) x->scales[8 * ip + 2 * k + l / 16] * (float) q);
+    }
+}
+
 // Every type below must also be in is_iq(): the host entry points refuse the others, so the default is unreachable.
 template<typename dst_t>
 __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
@@ -1236,6 +1252,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 13: dq_q5_k(vx, ibs, y, tid); break;
         case 7: dq_q5_1(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
+        case 14: dq_q6_k(vx, ibs, y, tid); break;
         default: break;
     }
 }
@@ -1258,7 +1275,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 8;
+           t == 12 || t == 13 || t == 7 || t == 8 || t == 14;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -1338,6 +1355,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
         default: return 0;
     }
 }

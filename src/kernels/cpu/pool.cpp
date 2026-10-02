@@ -7,6 +7,7 @@
 #include <cmath>
 #include <chrono>
 #include "strata/platform/cpu_relax.hpp"
+#include "strata/platform/thread_affinity.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -264,6 +265,11 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
 
 namespace {
 
+#if !defined(_WIN32)
+thread_local bool t_prev_valid = false;   // this thread's own affinity from before its pin, for the restore
+thread_local cpu_set_t t_prev;
+#endif
+
 void pin_this_thread(int core) {
     if (core < 0) return;
 #if defined(_WIN32)
@@ -292,8 +298,12 @@ long long pin_current_thread(int core) {
     unsigned long mask = 0;
     for (int i = 0; i < CPU_SETSIZE && i < 64; ++i)
         if (CPU_ISSET(i, &prev)) mask |= 1ul << i;
+    t_prev = prev;
+    t_prev_valid = true;
     pin_this_thread(core);
-    return (long long) mask;
+    strata::platform::note_host_pin(prev, core);   // the threads this one creates take `prev` back
+    // a set with no CPU under 64 would read as "refused" (0); the restore uses the whole set in t_prev
+    return mask != 0 ? (long long) mask : 1;
 #endif
 }
 
@@ -304,8 +314,13 @@ void restore_thread_affinity(long long previous) {
 #else
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int i = 0; i < 64; ++i)
-        if ((previous >> i) & 1) CPU_SET(i, &set);
+    if (t_prev_valid) {   // the whole set from before this thread's pin (CPUs 64 and up included)
+        set = t_prev;
+        t_prev_valid = false;
+    } else {
+        for (int i = 0; i < 64; ++i)
+            if ((previous >> i) & 1) CPU_SET(i, &set);
+    }
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
 #endif
 }

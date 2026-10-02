@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/platform/thread_affinity.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -868,7 +869,7 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
     src_ = src;
     x_.assign((size_t) (8 * n_embd), 0.f);
-    thread_ = std::thread([this] { run(); });
+    thread_ = std::thread([this] { strata::platform::release_inherited_pin(); run(); });
     return true;
 }
 

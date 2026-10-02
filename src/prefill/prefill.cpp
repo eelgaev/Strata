@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/platform/thread_affinity.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
@@ -213,6 +214,7 @@ struct Stager {
         }
     }
     void work() {
+        strata::platform::release_inherited_pin();
         cudaSetDevice(device);
         uint32_t seen = 0;
         for (;;) {
@@ -1218,6 +1220,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const bool threaded_issue = stream_all && issuer_on;
         if (threaded_issue) {
             issuer = std::thread([&] {
+                strata::platform::release_inherited_pin();
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {

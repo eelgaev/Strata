@@ -976,6 +976,17 @@ double probe_pcie_h2d_gbps() {
     return bw;
 }
 
+// A native pack's share of the missed experts the GPU computes over the link, from the probed bandwidth `bw`: none
+// below ~4 GB/s (an x1 link: the CPU pool is faster), scaled with the link up to 20 GB/s, the measured x16 default
+// `base` from there.  A coherent link far past PCIe - NVLink 2.0 to a POWER9, 72 GB/s probed on an IBM AC922 -
+// carries a missed expert faster than that CPU computes it: all of them.  Measured there, one V100, Unsloth
+// UD-Q4_K_XL with a 71 GiB RAM budget, decode: share 0 24.9 tok/s, 0.55 33.7, 0.8 37.3, 1.0 38.7.  From 60 GB/s,
+// so a PCIe 5.0 x16 link (~50-55 GB/s), not measured with a larger share, keeps the default.
+double pcie_share(double base, double bw) {
+    if (bw >= 60.0) return 1.0;
+    return bw >= 20.0 ? base : bw < 4.0 ? 0.0 : std::min(base, std::max(0.05, base * (bw / 26.0)));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1727,8 +1738,8 @@ int main(int argc, char** argv) {
             o.pcie_frac = base;
         } else if (bw > 0.0) {
             // below ~4 GB/s (an x1 link: ~0.9 GB/s) a missed expert's 1.4 MB takes longer to cross than the CPU
-            // pool takes to compute it, so none of them go over the link
-            o.pcie_frac = bw >= 20.0 ? base : bw < 4.0 ? 0.0 : std::min(base, std::max(0.05, base * (bw / 26.0)));
+            // pool takes to compute it, so none of them go over the link; past PCIe (NVLink) all of them do
+            o.pcie_frac = pcie_share(base, bw);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device -> pcie_frac %.2f (default %.2f)\n",
                          bw, o.pcie_frac, base);
         } else {
@@ -2239,7 +2250,7 @@ int main(int argc, char** argv) {
         st.pcie_frac = o.pcie_frac;
         if (!pcie_given && native_pack) {
             const double bw = probe_pcie_h2d_gbps();
-            if (bw > 0.0) st.pcie_frac = bw >= 20.0 ? 0.55 : bw < 4.0 ? 0.0 : std::min(0.55, std::max(0.05, 0.55 * (bw / 26.0)));
+            if (bw > 0.0) st.pcie_frac = pcie_share(0.55, bw);
             std::fprintf(stderr, "strata generate: layer split: CUDA%d PCIe probe %.1f GB/s -> pcie_frac %.2f\n", st.dev,
                          bw, st.pcie_frac);
         }

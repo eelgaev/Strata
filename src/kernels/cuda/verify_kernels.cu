@@ -238,6 +238,85 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
     }
 }
 
+__global__ void fetch_blobs_strided_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                           uint8_t* __restrict__ dst, long long per, int q0, int qstep) {
+    const int nq = *n > q0 ? (*n - q0 + qstep - 1) / qstep : 0;
+    const long long total = (long long) nq * per;
+    const long long S = (long long) gridDim.x * blockDim.x;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += S) {
+        const long long j = i / per, off = i - j * per;
+        const int q = q0 + (int) j * qstep;
+        ((uint4*) (dst + (size_t) q * (size_t) per * 16))[off] = ((const uint4*) src[q])[off];
+    }
+}
+
+__global__ void wait_and_clear_kernel(uint32_t* flag) {
+    volatile uint32_t* f = flag;
+    while (*f == 0) __nanosleep(100);
+    __threadfence_system();
+    *f = 0;
+}
+
+__global__ void partner_fetch_kernel(PartnerFetchArgs a) {
+    __shared__ unsigned long long sp[32];
+    __shared__ int s_n;
+    __shared__ int s_stop;
+    for (int k = 0; k < a.steps; ++k) {
+        const uint32_t ring = (uint32_t) k + 1;
+        if (threadIdx.x == 0) {
+            volatile const uint32_t* f = a.flagA;
+            uint32_t v;
+            while ((v = *f) < ring) __nanosleep(200);
+            s_stop = v == 0xffffffffu;
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (s_stop) return;
+        const int grp = k % a.G, l = a.lb + k / a.G;
+        const volatile int32_t* pl = a.plan + (size_t) grp * (size_t) a.plan_i32;
+        if (threadIdx.x == 0) s_n = pl[2];
+        __syncthreads();
+        const int n2 = s_n < 32 ? s_n : 32;
+        const volatile unsigned long long* p2 = (const volatile unsigned long long*) (pl + a.ptr_off) + a.capx;
+        if ((int) threadIdx.x < n2) sp[threadIdx.x] = p2[threadIdx.x];
+        __syncthreads();
+        const long long per16 = a.blob_bytes[l] / 16;
+        uint8_t* stage = a.staging + (size_t) (grp * a.per) * (size_t) a.max_blob;
+        const int nodd = n2 / 2;   // q = 1, 3, ... < n2
+        const long long total = (long long) nodd * per16;
+        const long long S = (long long) gridDim.x * blockDim.x;
+        long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+        for (; i + 3 * S < total; i += 4 * S) {
+            uint4 v[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const long long x = i + u * S, j = x / per16;
+                v[u] = ((const uint4*) sp[2 * j + 1])[x - j * per16];
+            }
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const long long x = i + u * S, j = x / per16;
+                ((uint4*) (stage + (size_t) (2 * j + 1) * (size_t) a.blob_bytes[l]))[x - j * per16] = v[u];
+            }
+        }
+        for (; i < total; i += S) {
+            const long long j = i / per16;
+            ((uint4*) (stage + (size_t) (2 * j + 1) * (size_t) a.blob_bytes[l]))[i - j * per16] =
+                ((const uint4*) sp[2 * j + 1])[i - j * per16];
+        }
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const unsigned prev = atomicAdd(&a.arrive[k], 1u);
+            if (prev == gridDim.x - 1) {
+                __threadfence_system();
+                *(volatile uint32_t*) (a.done + k) = 1u;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
     const int k = threadIdx.x;
     if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
@@ -333,6 +412,23 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     }();
     fetch_blobs_kernel<<<blocks, threads, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
+}
+
+void fetch_blobs_strided(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int q0,
+                         int qstep, void* stream) {
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
+    fetch_blobs_strided_kernel<<<24, 256, 0, (cudaStream_t) stream>>>(src, n, dst, (long long) (blob_bytes / 16), q0, qstep);
+    check("fetch_blobs_strided");
+}
+
+void wait_and_clear(uint32_t* flag, void* stream) {
+    wait_and_clear_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag);
+    check("wait_and_clear");
+}
+
+void partner_fetch(const PartnerFetchArgs& a, int blocks, void* stream) {
+    partner_fetch_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(a);
+    check("partner_fetch");
 }
 
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {

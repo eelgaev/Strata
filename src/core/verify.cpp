@@ -69,7 +69,8 @@ struct Bump {
 };
 
 bool mapped(size_t bytes, void** h, void** d) {
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
+    // portable: a layer split's partner GPU reads the plan and the flags too (Verifier::set_partner)
+    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return false;
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
@@ -133,6 +134,39 @@ const int64_t g_test_stall = [] {
 }();
 }  // namespace
 
+bool Verifier::set_partner(int dev, std::string& err) {
+    (void) err;
+    if (const char* v = std::getenv("STRATA_FETCH_PARTNER"); v != nullptr && std::atoi(v) == 0) return true;
+    if (dev < 0 || dev == device_ || !fetch_overlap_ || sink_.pcie_mode != 2 || device_plan_) return true;
+    if ((le_ - lb_) * 2 > kMaxSteps) return true;
+    int can = 0;
+    if (cudaDeviceCanAccessPeer(&can, dev, device_) != cudaSuccess || !can) { cudaGetLastError(); return true; }
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    std::vector<long long> bytes((size_t) le_, 0);
+    for (int64_t l = 0; l < le_; ++l) bytes[(size_t) l] = (long long) lay.blob_bytes(l);
+    {
+        const OnDevice on(dev);
+        const cudaError_t pe = cudaDeviceEnablePeerAccess(device_, 0);
+        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); return true; }
+        cudaGetLastError();
+        if (cudaStreamCreateWithFlags(&partner_s_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaMalloc((void**) &partner_arrive_, kMaxSteps * sizeof(unsigned)) != cudaSuccess ||
+            cudaMalloc((void**) &partner_bytes_, bytes.size() * sizeof(long long)) != cudaSuccess ||
+            cudaMemcpy(partner_bytes_, bytes.data(), bytes.size() * sizeof(long long), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaGetLastError();
+            return true;
+        }
+    }
+    {
+        const OnDevice on(device_);
+        if (!mapped(kMaxSteps * sizeof(uint32_t), (void**) &h_pdone_, (void**) &m_pdone_)) { cudaGetLastError(); return true; }
+    }
+    partner_ = dev;
+    std::fprintf(stderr, "strata verify: CUDA%d fetches half of CUDA%d's PCIe experts (peer, STRATA_FETCH_PARTNER)\n",
+                 dev, device_);
+    return true;
+}
+
 bool Verifier::release_gpu_waits(int timeout_ms) {
     released_.store(true);
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
@@ -140,6 +174,8 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    if (h_pdone_ != nullptr)   // the waits on the partner's share (the partner itself stops on flag A)
+        for (int k = 0; k < kMaxSteps; ++k) *(volatile uint32_t*) (h_pdone_ + k) = 1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     strata_store_fence();
     const OnDevice on_device(device_);
@@ -178,6 +214,12 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (fetch_s_) { cudaStreamSynchronize(fetch_s_); cudaStreamDestroy(fetch_s_); }
+    if (partner_ >= 0) {
+        const OnDevice on(partner_);
+        if (partner_s_) { cudaStreamSynchronize(partner_s_); cudaStreamDestroy(partner_s_); }
+        if (partner_arrive_) cudaFree(partner_arrive_);
+        if (partner_bytes_) cudaFree(partner_bytes_);
+    }
     if (ev_plan_) cudaEventDestroy(ev_plan_);
     if (ev_fetched_) cudaEventDestroy(ev_fetched_);
     if (commit_done_) cudaEventDestroy(commit_done_);
@@ -784,7 +826,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, s);
+                if (partner_ >= 0) {   // the even blobs here, the odd ones by the partner (set_partner)
+                    fetch_blobs_strided(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), 0, 2, s);
+                    wait_and_clear(m_pdone_ + (ring - 1), s);
+                } else {
+                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, s);
+                }
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), s);
             }
         };
@@ -1095,6 +1142,27 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
+    if (partner_ >= 0 && steps <= kMaxSteps) {   // the peer's half of this window's PCIe experts (set_partner)
+        const OnDevice on(partner_);
+        const int64_t capx = (int64_t) max_t_ * ss.k;
+        strata::kernels::PartnerFetchArgs a{};
+        a.flagA = h_flagA_;
+        a.plan = h_plan_;
+        a.plan_i32 = plan_i32_;
+        a.ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+        a.capx = capx;
+        a.G = G;
+        a.steps = (int) steps;
+        a.lb = (int) lb_;
+        a.blob_bytes = partner_bytes_;
+        a.staging = staging_;
+        a.per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+        a.max_blob = (long long) strata::kernels::cpu::expert_layout().max_blob;
+        a.done = m_pdone_;
+        a.arrive = partner_arrive_;
+        cudaMemsetAsync(partner_arrive_, 0, (size_t) steps * sizeof(unsigned), partner_s_);
+        strata::kernels::partner_fetch(a, 24, partner_s_);
+    }
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;

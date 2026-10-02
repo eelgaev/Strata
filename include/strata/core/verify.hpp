@@ -152,6 +152,10 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// A layer split's idle NVLink peer fetches half of this stage's PCIe experts (partner_fetch, verify_kernels.hpp):
+    /// call after set_pcie_mode, before the first window.  STRATA_FETCH_PARTNER=0: off.  No-op unless the copy kernel
+    /// overlaps (pcie_mode 2, STRATA_FETCH_OVERLAP) and the peer reaches this GPU.
+    bool set_partner(int dev, std::string& err);
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
@@ -227,6 +231,12 @@ private:
     cudaStream_t fetch_s_ = nullptr;
     cudaEvent_t ev_plan_ = nullptr, ev_fetched_ = nullptr;
     bool fetch_overlap_ = false;
+    int partner_ = -1;                                            // set_partner: the peer GPU, or -1
+    cudaStream_t partner_s_ = nullptr;                            // on the peer
+    unsigned* partner_arrive_ = nullptr;                          // on the peer, one per step
+    long long* partner_bytes_ = nullptr;                          // on the peer, blob bytes per layer
+    uint32_t* h_pdone_ = nullptr; uint32_t* m_pdone_ = nullptr;   // mapped, one per step: the peer's share landed
+    static constexpr int kMaxSteps = 2 * 64 * 2;
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);

@@ -4292,6 +4292,23 @@ int main(int argc, char** argv) {
                 stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
             }
         }
+        // the missed-expert fetch: each stage's same-socket peer GPU (an AC922's NVLink pair) fetches half of it
+        if (n_stages > 1 && !split_same) {
+            ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+            int dev0 = 0;
+            cudaGetDevice(&dev0);
+            auto dev_of = [&](int st) { return st == 0 ? dev0 : stages[(size_t) st - 1]->dev; };
+            for (int st = 0; st < n_stages; ++st) {
+                int peer = -1;
+                for (int o2 = 0; o2 < n_stages && peer < 0; ++o2)
+                    if (o2 != st && gpu_numa_node(dev_of(o2)) >= 0 && gpu_numa_node(dev_of(o2)) == gpu_numa_node(dev_of(st)))
+                        peer = dev_of(o2);
+                if (peer >= 0 && !stage_ver(st).set_partner(peer, err)) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+        }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;

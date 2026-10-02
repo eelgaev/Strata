@@ -72,6 +72,27 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream);
 /// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream);
+/// fetch_blobs for the blobs q = q0, q0 + qstep, ... below *n only (the rest come from a partner GPU).
+void fetch_blobs_strided(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int q0,
+                         int qstep, void* stream);
+/// Spin until *flag (mapped host memory) is non-zero, then clear it: the partner GPU's share of a layer has landed.
+void wait_and_clear(uint32_t* flag, void* stream);
+/// The partner GPU's share of a verify window's PCIe experts (a layer split's idle NVLink peer).  Step k (ring k+1):
+/// wait for the plan (flagA >= k+1, mapped), copy the plan's odd PCIe blobs (q = 1, 3, ...) from host memory into the
+/// active GPU's staging (peer writes over NVLink), then the last block sets done[k] (mapped).  flagA = UINT32_MAX
+/// (release_gpu_waits) ends it.
+struct PartnerFetchArgs {
+    const uint32_t* flagA;          // mapped, portable
+    const int32_t* plan;            // the mapped plan, group g at plan + g * plan_i32
+    long long plan_i32, ptr_off, capx;
+    int G, steps, lb;
+    const long long* blob_bytes;    // per layer, on the partner GPU
+    uint8_t* staging;               // the active GPU's staging (peer)
+    long long per, max_blob;        // staging blobs per group, slot size
+    uint32_t* done;                 // mapped, one per step
+    unsigned* arrive;               // on the partner GPU, one per step, zeroed per window
+};
+void partner_fetch(const PartnerFetchArgs& a, int blocks, void* stream);
 
 // ---- the MTP draft layer (src/core/mtp.cpp)
 /// R[t][c][:] = h[t][c][:] + e[t][:]  (the embedding branch added to every stream).

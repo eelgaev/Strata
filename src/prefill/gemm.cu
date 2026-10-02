@@ -1,6 +1,8 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/prefill/kernels.hpp"
+#include <cuda_fp16.h>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -281,6 +283,7 @@ Gemm::~Gemm() {
     delete static_cast<HipLtState*>(hipblaslt_state_);
 #endif
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
+    if (w16_) cudaFree(w16_);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
         if (workspace_) cudaFree(workspace_);
@@ -355,9 +358,35 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     return true;
 }
 
+namespace {
+__global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        y[i] = __half_as_ushort(__float2half_rn(__uint_as_float((uint32_t) x[i] << 16)));
+}
+}  // namespace
+
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta) {
     if (T <= 0 || N <= 0) return;
+    if (strata::prefill::prefill_f16_mode() != 0) {
+        // X is already FP16 (the producers wrote FP16 images); W to FP16 here, every call: a weight's memory may be
+        // a staging buffer refilled under the same pointer (PLE), and the conversion is ~10 us per 6.5 MB weight.
+        const int64_t n = N * K;
+        if (n > w16_elems_) {
+            if (w16_) cudaFree(w16_);
+            w16_ = nullptr;
+            w16_elems_ = 0;
+            if (cudaMalloc((void**) &w16_, (size_t) n * 2) != cudaSuccess) {
+                std::fprintf(stderr, "prefill gemm: FP16 weight scratch of %lld elements\n", (long long) n);
+                std::exit(1);
+            }
+            w16_elems_ = n;
+        }
+        const int64_t blocks = (n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096;
+        bf16_to_f16_kernel<<<(unsigned) blocks, 256, 0, (cudaStream_t) stream_>>>(W, w16_, n);
+        f16(X, w16_, Y, T, N, K, ldy, beta);
+        return;
+    }
     if (ldy <= 0) ldy = N;
     const float alpha = 1.0f;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)

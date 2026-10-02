@@ -12,6 +12,14 @@
 
 namespace strata::prefill {
 
+/// STRATA_PREFILL_F16: the BF16-weight projections (hyper-connection, router, shared gate, SSM alpha/beta, indexer,
+/// PLE key/value, the draft layer's) run as FP16 GEMMs; V100 has no BF16 tensor cores (cuBLAS BF16 is 3-18x slower
+/// there).  The weights are converted BF16 -> FP16 per GEMM (exact for these: |w| <= 8.6; values below 6.1e-5 become
+/// FP16 subnormals).  The "BF16 images" below are then FP16 bits.  1 = the BF16-rounded activation in FP16 (the same
+/// products as BF16; only cuBLAS's summation order differs); 2 = the activation rounded straight to FP16 (3 more
+/// mantissa bits).  0 (the default: opt-in, it can change the prompt path's numbers) = BF16 as before.
+int prefill_f16_mode();
+
 // ---- hyper-connection (n_embd 2560, hc 4, hc_lr 320)
 /// xn[t, c*2560 + d] = R[t,c,d] * rsqrt(mean_d R[t,c,:]^2 + eps) * w_norm[c*2560 + d]; also its BF16 image.
 /// `xn16_lo` (null: none) takes bf16(x - xn16): W.xn16 + W.xn16_lo is the product with ~16 mantissa bits of x.

@@ -52,6 +52,8 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    uint16_t* w16_ = nullptr;    ///< STRATA_PREFILL_F16: the BF16 weight converted to FP16
+    int64_t w16_elems_ = 0;
 };
 
 

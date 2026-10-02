@@ -139,6 +139,19 @@ void LoadConverted::served_names(std::set<std::string>& out) const {
 }
 
 bool LoadConverted::attach(WeightTable& table, std::vector<void*>& owner, std::string& err) const {
+    // ONE allocation per GPU for all of them: 483 cudaMallocs of 5 KB..13 MB each cost ~400 MiB of VRAM more than
+    // their bytes (measured: the expert cache lost ~700 slots on 4 GPUs)
+    auto align = [](uint64_t n) { return (n + 255) & ~(uint64_t) 255; };
+    uint64_t total = 0;
+    for (const auto& h : host_) total += align(h.data.size());
+    void* slab = nullptr;
+    if (const cudaError_t e = cudaMalloc(&slab, total); e != cudaSuccess) {
+        err = "STRATA_FP16=load: " + std::to_string((unsigned long long) (total >> 20)) + " MiB for the converted "
+              "weights: " + cudaGetErrorString(e);
+        return false;
+    }
+    owner.push_back(slab);
+    uint64_t off = 0;
     for (const auto& h : host_) {
         auto it = table.table_.find(h.name);
         if (it == table.table_.end()) { err = "STRATA_FP16=load: " + h.name + " is not in the pack"; return false; }
@@ -149,12 +162,9 @@ bool LoadConverted::attach(WeightTable& table, std::vector<void*>& owner, std::s
                   std::to_string((long long) r.ne1) + ")";
             return false;
         }
-        void* p = nullptr;
-        cudaError_t e = cudaMalloc(&p, h.data.size());
-        if (e == cudaSuccess) {
-            owner.push_back(p);
-            e = cudaMemcpy(p, h.data.data(), h.data.size(), cudaMemcpyHostToDevice);
-        }
+        void* p = static_cast<uint8_t*>(slab) + off;
+        off += align(h.data.size());
+        const cudaError_t e = cudaMemcpy(p, h.data.data(), h.data.size(), cudaMemcpyHostToDevice);
         if (e != cudaSuccess) { err = "STRATA_FP16=load: upload of " + h.name + ": " + cudaGetErrorString(e); return false; }
         r.data = p;
         r.bytes = h.data.size();

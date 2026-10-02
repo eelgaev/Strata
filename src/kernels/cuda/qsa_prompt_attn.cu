@@ -970,6 +970,271 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
 }
 #endif
 
+// ---- P4: the int8-KV prompt attention on Volta tensor cores (sm_70; opt-in: STRATA_ATTN_WMMA=1). The RDNA4 kernel's
+// design (above) with CUDA wmma 16x16x16 (FP16 in, FP32 accumulate): warp w owns dims [64w, 64w+64) (int8 scale group
+// w) for q.k and p.v; q and p split into FP16 hi + lo, the int8 codes exact in FP16, scales applied in FP32, the four
+// groups' q.k partials added in a fixed order, the online softmax in FP32. Volta's fragments are opaque, so the tiles
+// go through shared memory: q once (its A fragments stay in registers), each warp's K slice (then its V slice, same
+// buffer) and P per chunk; the p.v tile is stored and added to a per-thread FP32 accumulator with the rescale.
+// FP32-level accuracy, deterministic, not bitwise equal to the FP32 kernel (another summation order).
+#if !defined(__HIPCC__)
+}  // namespace
+}  // namespace strata::kernels
+#include <mma.h>
+namespace strata::kernels {
+namespace {
+constexpr int VCH = 32;          // cells per chunk
+constexpr int VLD = 72;          // staged K/V row stride (halves): 64 dims + 8 (16-byte multiple, banks spread)
+constexpr int PLD = 40;          // P row stride (halves)
+constexpr int SLD = 36;          // q.k partial row stride (floats)
+constexpr int OLD_ = 64;         // p.v tile row stride (floats)
+struct alignas(32) SmemV {
+    union alignas(32) {
+        __half q[2][16][HD];               // q hi / lo, read once into fragments
+        float part[4][16][SLD];            // q.k per dim group
+        float ot[4][16][OLD_];             // a chunk's p.v tile per warp
+    } u;
+    __half kv[4][VCH][VLD];                // per warp: the chunk's K slice, then its V slice
+    __half ph[4][16][PLD], pl[4][16][PLD]; // per warp: P (times the group's V scale) hi / lo
+    float p[16][VCH + 1];
+    float ks[4][VCH], vs[4][VCH];          // K / V scale per (group, cell)
+    int valid[VCH];
+    float qmax[4], alpha[16], lsum[16], mrow[16];
+};
+
+__device__ __forceinline__ void i8x16_to_h(uint4 x, __half* dst) {   // exact: |code| <= 128
+    const uint32_t w[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int b = 0; b < 4; ++b) dst[4 * i + b] = __int2half_rn((int) (int8_t) (w[i] >> (8 * b)));
+}
+
+__global__ void __launch_bounds__(THREADS) prompt_attn_volta_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                                    const int32_t* __restrict__ ids,
+                                                                    const int32_t* __restrict__ steps, int n_kv_heads,
+                                                                    int page_size, float scale_log2,
+                                                                    float* __restrict__ attn, int cap) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char smem_raw[];
+    SmemV& S = *reinterpret_cast<SmemV*>(smem_raw);
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int dim0 = warp * 64;
+
+    // q: the block's scale (as the RDNA4 kernel), then hi / lo in shared memory, rows 12..15 zero
+    float qm = 0.0f;
+    for (int i = t; i < G * HD; i += THREADS) qm = fmaxf(qm, fabsf(q[i]));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+    if (lane == 0) S.qmax[warp] = qm;
+    if (t < 16) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) frexpf(qm, &qe);
+    const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(scale_log2, qe - 14);
+    for (int i = t; i < 16 * HD; i += THREADS) {
+        const int r = i / HD, d = i % HD;
+        const float v = r < G ? q[(size_t) r * HD + d] * qup : 0.0f;
+        const __half hi = __float2half_rn(v);
+        S.u.q[0][r][d] = hi;
+        S.u.q[1][r][d] = __float2half_rn(v - __half2float(hi));
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qh[4], ql[4];
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+        wmma::load_matrix_sync(qh[kk], &S.u.q[0][0][dim0 + kk * 16], HD);
+        wmma::load_matrix_sync(ql[kk], &S.u.q[1][0][dim0 + kk * 16], HD);
+    }
+    float acc[16][2];   // this lane's p.v outputs: rows 0..15, dims dim0 + lane and dim0 + 32 + lane
+#pragma unroll
+    for (int r = 0; r < 16; ++r) acc[r][0] = acc[r][1] = 0.0f;
+
+    const int n_chunks = (n + VCH - 1) / VCH;
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const int c0 = ci * VCH;
+        __syncthreads();   // the union (q / part / ot) and S.p are free again
+        long long myrow = -1;   // this lane's cell: its pool row, or -1 (past the selection, or non-resident: masked)
+        if (c0 + lane < n) {
+            const int cell = __ldg(ids + c0 + lane);
+            const long long page = (long long) __ldg(p.page_table + cell / page_size);
+            if (page >= 0) myrow = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        {   // this warp's K slice of the lane's cell, as FP16
+            uint4 k4[4] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+            float ksc = 0.0f, vsc = 0.0f;
+            if (myrow >= 0) {
+                const uint4* src = reinterpret_cast<const uint4*>(p.k_q + myrow * HD + dim0);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) k4[i] = __ldg(src + i);
+                ksc = __half2float(__ushort_as_half(__ldg(p.k_scale + myrow * (HD / KV_Q8_GROUP) + warp)));
+                vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + myrow * (HD / KV_Q8_GROUP) + warp)));
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) i8x16_to_h(k4[i], &S.kv[warp][lane][16 * i]);
+            S.ks[warp][lane] = ksc;
+            S.vs[warp][lane] = vsc;
+            if (warp == 0) S.valid[lane] = myrow >= 0;
+        }
+        __syncwarp();
+        // q.k over this warp's 64 dims for two 16-cell tiles: B = K^T (k = dim, n = cell): column-major in kv
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> s;
+            wmma::fill_fragment(s, 0.0f);
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+                wmma::load_matrix_sync(b, &S.kv[warp][nt * 16][kk * 16], VLD);
+                wmma::mma_sync(s, qh[kk], b, s);
+                wmma::mma_sync(s, ql[kk], b, s);
+            }
+            wmma::store_matrix_sync(&S.u.part[warp][0][nt * 16], s, SLD, wmma::mem_row_major);
+        }
+        __syncwarp();
+        {   // now this warp's V slice into the same buffer
+            uint4 v4[4] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+            if (myrow >= 0) {
+                const uint4* src = reinterpret_cast<const uint4*>(p.v_q + myrow * HD + dim0);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) v4[i] = __ldg(src + i);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) i8x16_to_h(v4[i], &S.kv[warp][lane][16 * i]);
+        }
+        __syncthreads();
+        // online softmax over the four groups' sum (fixed order, each times its K scale): row t/8, 4 cells per thread
+        {
+            const int r = t >> 3, sub = t & 7;
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub * 4 + j;
+                x[j] = S.valid[c] ? (((S.u.part[0][r][c] * S.ks[0][c] + S.u.part[1][r][c] * S.ks[1][c]) +
+                                      S.u.part[2][r][c] * S.ks[2][c]) + S.u.part[3][r][c] * S.ks[3][c]) * qdown
+                                  : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                S.p[r][sub * 4 + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                S.mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+        // p.v over this warp's 64 dims: P (times the group's V scale, normalized to 16384) hi / lo
+        float vmax = S.vs[warp][lane];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+        const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
+        for (int i = lane; i < 16 * VCH; i += 32) {
+            const int r = i / VCH, c = i % VCH;
+            const float pv = S.p[r][c] * (S.vs[warp][c] * vup);
+            const __half hi = __float2half_rn(pv);
+            S.ph[warp][r][c] = hi;
+            S.pl[warp][r][c] = __float2half_rn(pv - __half2float(hi));
+        }
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> o;
+            wmma::fill_fragment(o, 0.0f);
+#pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> ah, al;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b;
+                wmma::load_matrix_sync(ah, &S.ph[warp][0][ks * 16], PLD);
+                wmma::load_matrix_sync(al, &S.pl[warp][0][ks * 16], PLD);
+                wmma::load_matrix_sync(b, &S.kv[warp][ks * 16][j * 16], VLD);
+                wmma::mma_sync(o, ah, b, o);
+                wmma::mma_sync(o, al, b, o);
+            }
+            wmma::store_matrix_sync(&S.u.ot[warp][0][j * 16], o, OLD_, wmma::mem_row_major);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const float a = S.alpha[r];
+            acc[r][0] = fmaf(acc[r][0], a, S.u.ot[warp][r][lane] * vdown);
+            acc[r][1] = fmaf(acc[r][1], a, S.u.ot[warp][r][32 + lane] * vdown);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < G; ++r) {
+        const float l = S.lsum[r];
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        attn[(size_t) r * HD + dim0 + lane] = acc[r][0] * inv;
+        attn[(size_t) r * HD + dim0 + 32 + lane] = acc[r][1] * inv;
+    }
+#else
+    __trap();
+#endif
+}
+
+bool volta_wmma_wanted() {
+    static const bool want = [] { const char* e = std::getenv("STRATA_ATTN_WMMA"); return e != nullptr && e[0] == '1'; }();
+    return want;
+}
+
+bool launch_volta(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                  const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    static bool told[64] = {}, set[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const size_t smem = sizeof(SmemV);
+    if (dev >= 0 && dev < 64 && !set[dev]) {
+        set[dev] = true;
+        if (cudaFuncSetAttribute(prompt_attn_volta_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) !=
+            cudaSuccess) {
+            std::fprintf(stderr, "qsa_prompt_attn_batch (volta): %zu bytes of shared memory: %s\n", smem,
+                         cudaGetErrorString(cudaGetLastError()));
+            std::exit(1);
+        }
+    }
+    if (dev >= 0 && dev < 64 && !told[dev]) {
+        told[dev] = true;
+        std::fprintf(stderr, "strata: STRATA_ATTN_WMMA: the prompt attention on Volta tensor cores (CUDA%d, %zu B shared)\n",
+                     dev, smem);
+    }
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        prompt_attn_volta_kernel<<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, smem, st>>>(
+            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (volta): %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
+#endif
+
 }  // namespace
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
@@ -995,6 +1260,13 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             cc[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) ? 75
                       : 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
         }
+#if !defined(__HIPCC__)
+        // P4: Volta (sm_70) on its own tensor cores, opt-in (STRATA_ATTN_WMMA=1), int8 KV only
+        if (cc[dev] >= 70 && cc[dev] < 75 && volta_wmma_wanted() && pools.k_q != nullptr && pools.v_q != nullptr &&
+            pools.k_scale != nullptr && pools.v_scale != nullptr && pools.k_q4 == nullptr && pools.v_q4 == nullptr &&
+            s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv && cap > 0 && ids && steps && pools.page_table)
+            return launch_volta(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+#endif
         if (cc[dev] < 75) return false;
         turing = cc[dev] < 80;
     }

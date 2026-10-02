@@ -215,13 +215,26 @@ int main(int argc, char** argv) {
 #endif
     }
 #endif
+#if !defined(__HIP_PLATFORM_AMD__)
+    // P4: on Volta (sm_70) the kernel under test is the opt-in tensor-core one (STRATA_ATTN_WMMA), int8 KV only
+    bool volta = false;
+    {
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && major == 7 && minor < 5) {
+            volta = true;
+            setenv("STRATA_ATTN_WMMA", "1", 1);
+        }
+    }
+#endif
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
     int fails = 0;
     fails += run(1, ctx, nq, reps);
 #if !defined(__HIP_PLATFORM_AMD__)
-    fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
+    if (!volta) fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 and Volta kernels take int8 KV only
 #endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge

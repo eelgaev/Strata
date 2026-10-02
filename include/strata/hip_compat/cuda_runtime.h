@@ -10,6 +10,7 @@
 #define cudaDevAttrClockRate hipDeviceAttributeClockRate
 #define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
 #define cudaDevAttrIntegrated hipDeviceAttributeIntegrated
+#define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize

@@ -753,6 +753,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     const float* w_hn = mtp.tensor_f32("attn_hyper_connection.hc_norm.weight");
     const uint16_t* w_dn = mtp.tensor_bf16("attn_hyper_connection.input_mix_weight_down.weight");
     const uint16_t* w_up = mtp.tensor_bf16("attn_hyper_connection.input_mix_weight_up.weight");
+    const uint16_t* w_dn16 = mtp.tensor_f16("attn_hyper_connection.input_mix_weight_down.weight");
+    const uint16_t* w_up16 = mtp.tensor_f16("attn_hyper_connection.input_mix_weight_up.weight");
     const void* w_k = mtp.tensor_q8("self_attn.k_proj.weight");
     const void* w_v = mtp.tensor_q8("self_attn.v_proj.weight");
     const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
@@ -852,7 +854,15 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         proj(hn, hn16, w_fh, h2, nb * g.hc, Nn, Nn, 1);   // every stream through fc_hidden
         strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
         // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
-        {
+        if (w_dn16 != nullptr) {
+            // STRATA_FP16_MTP=1: the FP16 copies made at load, FP16 images
+            const F16Images keep;
+            gr_norm_rs(Rm, w_hn, EPS, grs, xn16, nb, m.cs);
+            m.gemm.f16(xn16, w_dn16, lo, nb, LR, HCN);
+            gr_silu(lo, lo16, nb, m.cs);
+            m.gemm.f16(lo16, w_up16, gated, nb, HCN, LR);
+            gr_mix_r(Rm, grs, w_hn, gated, mixed, nullptr, nb, m.cs, mixed_h);
+        } else {
             const Bf16Images keep;   // the drafter's weights stay BF16 under STRATA_FP16=load
             gr_norm_rs(Rm, w_hn, EPS, grs, xn16, nb, m.cs);
             m.gemm.bf16(xn16, w_dn, lo, nb, LR, HCN);

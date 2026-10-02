@@ -91,6 +91,8 @@ public:
     /// state, the first cell a round can still read, its device, and a wait for its own stream.
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
+    /// STRATA_FP16_MTP=1: the FP16 copy (made at load) of a BF16 tensor the prompt path reads; null otherwise.
+    const uint16_t* tensor_f16(const char* name) const;
     const void* tensor_q8(const char* name) const { return q8(name); }
     QsaState& kv_state_rw() { return st_; }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
@@ -142,6 +144,8 @@ private:
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
+    uint16_t* f16_ = nullptr;                                  ///< STRATA_FP16_MTP=1: FP16 copies, see tensor_f16
+    std::vector<std::pair<std::string, size_t>> f16_off_;      ///< name -> element offset in f16_
     uint8_t* experts_ = nullptr;
     void* state_arena_ = nullptr;
     QsaState st_;

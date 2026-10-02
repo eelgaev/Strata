@@ -28,6 +28,16 @@ public:
 private:
     int prev_;
 };
+/// While alive (this thread): FP16 images (rounded straight from FP32), for the weights STRATA_FP16_MTP=1 holds in FP16.
+class F16Images {
+public:
+    F16Images();
+    ~F16Images();
+    F16Images(const F16Images&) = delete;
+    F16Images& operator=(const F16Images&) = delete;
+private:
+    int prev_;
+};
 /// STRATA_FP16=load, F32 inject weights: inj[t*4 + o] = sum_j xn[t, j] * w[o*10240 + j] in FP32, with xn recomputed
 /// from R, the row scales rs and the norm weights exactly as gr_mix_r does (no 16-bit image).
 void gr_inject_f32(const float* R, const float* rs, const float* w_norm, const float* w_inject, float* inj, int64_t T,

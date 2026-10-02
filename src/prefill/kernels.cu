@@ -719,6 +719,8 @@ int prefill_f16_mode() {
 }
 Bf16Images::Bf16Images() : prev_(g_images_override) { g_images_override = 0; }
 Bf16Images::~Bf16Images() { g_images_override = prev_; }
+F16Images::F16Images() : prev_(g_images_override) { g_images_override = 2; }
+F16Images::~F16Images() { g_images_override = prev_; }
 void gr_inject_f32(const float* R, const float* rs, const float* w_norm, const float* w_inject, float* inj, int64_t T,
                    void* stream) {
     if (T <= 0) return;

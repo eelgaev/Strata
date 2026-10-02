@@ -38,4 +38,15 @@ inline bool fp16_gates() {
     return v && fp16_mode() == Fp16Mode::Load;
 }
 
+/// STRATA_FP16_MTP=1: the MTP drafter's prompt-path GEMMs (its attention hyper-connection down/up, run per prompt chunk)
+/// as FP16: those two BF16 weights converted to FP16 when the drafter loads, FP16 activations.  Its decode is unchanged
+/// (FP32 activations).  Independent of STRATA_FP16.
+inline bool fp16_mtp() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_FP16_MTP");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+
 }  // namespace strata

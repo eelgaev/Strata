@@ -1,4 +1,7 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
+#include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
+#include "strata/core/fp16_mode.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
@@ -117,6 +120,7 @@ MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamDestroy(cs_);
     if (dense_) cudaFree(dense_);
     if (experts_) cudaFree(experts_);
+    if (f16_) cudaFree(f16_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
@@ -136,6 +140,11 @@ const uint16_t* MtpDrafter::bf16(const char* name) const {
 }
 const void* MtpDrafter::q8(const char* name) const {
     for (const auto& t : tensors_) if (t.name == name && t.kind == "q8_0") return dense_ + t.off;
+    return nullptr;
+}
+
+const uint16_t* MtpDrafter::tensor_f16(const char* name) const {
+    for (const auto& [n, off] : f16_off_) if (n == name) return f16_ + off;
     return nullptr;
 }
 
@@ -176,6 +185,41 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         vram_ += blob.size();
+    }
+    // ---- STRATA_FP16_MTP=1: FP16 copies of the BF16 weights the prompt path's GEMMs read (exact: BF16 values in
+    //      FP16's range; the count of values that became FP16 subnormals or zero is reported)
+    if (strata::fp16_mtp()) {
+        static const char* names[] = {"attn_hyper_connection.input_mix_weight_down.weight",
+                                      "attn_hyper_connection.input_mix_weight_up.weight"};
+        std::vector<uint8_t> blob;
+        if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
+        std::vector<uint16_t> host;
+        uint64_t sub = 0, zero = 0, over = 0;
+        for (const char* n : names) {
+            const Tensor* t = nullptr;
+            for (const auto& x : tensors_) if (x.name == n) t = &x;
+            if (t == nullptr || t->kind != "bf16") { err = std::string("mtp: STRATA_FP16_MTP=1: ") + n + " is not BF16"; return false; }
+            f16_off_.emplace_back(n, host.size());
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(blob.data() + t->off);
+            for (uint64_t i = 0; i < t->bytes / 2; ++i) {
+                const float x = strata::kernels::f32_from_bf16(src[i]);
+                const uint16_t h = strata::kernels::f16_from_f32(x);
+                if (std::fabs(x) > 65504.0f) ++over;
+                else if (x != 0.0f && (h & 0x7fffu) == 0) ++zero;
+                else if (x != 0.0f && (h & 0x7c00u) == 0) ++sub;
+                host.push_back(h);
+            }
+        }
+        if (over) { err = "mtp: STRATA_FP16_MTP=1: " + std::to_string((unsigned long long) over) + " values beyond FP16's range"; return false; }
+        if (cudaMalloc((void**) &f16_, host.size() * 2) != cudaSuccess ||
+            cudaMemcpy(f16_, host.data(), host.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "mtp: STRATA_FP16_MTP=1: the FP16 copies do not fit in VRAM";
+            return false;
+        }
+        vram_ += host.size() * 2;
+        std::fprintf(stderr, "strata mtp: STRATA_FP16_MTP=1: the prompt path's 2 hyper-connection weights as FP16 (%.1f MiB; "
+                             "%llu values became FP16 subnormals, %llu zero)\n", (double) host.size() * 2 / 1048576.0,
+                     (unsigned long long) sub, (unsigned long long) zero);
     }
     // ---- the 512 routed experts, one blob each
     {

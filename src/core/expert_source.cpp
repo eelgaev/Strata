@@ -2281,9 +2281,9 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             }
         }
     };
+    // every worker on its own thread, on the arena's node (run_on_arena_node, pinned.hpp)
     std::vector<std::thread> pool;
-    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
-    worker();
+    for (int i = 0; i < threads; ++i) pool.emplace_back([&] { run_on_arena_node(dst); worker(); });
     for (auto& t : pool) t.join();
     if (bad) {
         st.seconds = -1.0;

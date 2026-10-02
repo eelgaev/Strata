@@ -25,6 +25,8 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -280,6 +282,49 @@ bool sliced_pin_limit(uint64_t& limit, std::string& why) {
 }  // namespace
 
 namespace {
+#if !defined(_WIN32)
+// The CPUs of NUMA node `node` (sysfs cpulist); false if none.
+bool node_cpus(int node, cpu_set_t& set) {
+    CPU_ZERO(&set);
+    if (node < 0) return false;
+    char path[96];
+    std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+    std::FILE* f = std::fopen(path, "r");
+    if (f == nullptr) return false;
+    int lo = 0, hi = 0;
+    char sep = 0;
+    while (std::fscanf(f, "%d", &lo) == 1) {
+        hi = lo;
+        if (std::fscanf(f, "%c", &sep) == 1 && sep == '-' && std::fscanf(f, "%d", &hi) == 1) (void) std::fscanf(f, "%c", &sep);
+        for (int c = lo; c <= hi && c < CPU_SETSIZE; ++c) CPU_SET(c, &set);
+    }
+    std::fclose(f);
+    return CPU_COUNT(&set) > 0;
+}
+// The NUMA node of the current CUDA device (its PCI device's numa_node), or -1.
+int current_gpu_node() {
+    int dev = 0;
+    char bus[64] = {};
+    unsigned dom = 0, b = 0, d = 0, fn = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &fn) != 4) return -1;
+    char path[128];
+    std::snprintf(path, sizeof path, "/sys/bus/pci/devices/%04x:%02x:%02x.%x/numa_node", dom, b, d, fn);
+    int node = -1;
+    if (std::FILE* f = std::fopen(path, "r")) {
+        if (std::fscanf(f, "%d", &node) != 1) node = -1;
+        std::fclose(f);
+    }
+    return node;
+}
+// cudaHostAlloc'd arenas and their nodes, for run_on_arena_node
+struct ArenaRange { const uint8_t* begin; const uint8_t* end; int node; };
+std::mutex g_arenas_mu;
+std::vector<ArenaRange> g_arenas;
+#endif
 std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
     std::vector<uint64_t> b;
     if (slice == 0) return b;
@@ -289,6 +334,40 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
 }
 }  // namespace
 
+cudaError_t cuda_host_alloc_near_gpu(void** p, size_t bytes, unsigned int flags) {
+#if !defined(_WIN32)
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return cudaHostAlloc(p, bytes, flags);
+    const int node = current_gpu_node();
+    cpu_set_t set;
+    if (!node_cpus(node, set)) return cudaHostAlloc(p, bytes, flags);
+    cudaError_t e = cudaSuccess;
+    std::thread([&] {
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+        (void) cudaSetDevice(dev);
+        e = cudaHostAlloc(p, bytes, flags);
+    }).join();
+    return e;
+#else
+    return cudaHostAlloc(p, bytes, flags);
+#endif
+}
+
+void run_on_arena_node(const void* p) {
+#if !defined(_WIN32)
+    int node = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_arenas_mu);
+        for (const ArenaRange& r : g_arenas)
+            if ((const uint8_t*) p >= r.begin && (const uint8_t*) p < r.end) node = r.node;
+    }
+    cpu_set_t set;
+    if (node_cpus(node, set)) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#else
+    (void) p;
+#endif
+}
+
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
@@ -297,7 +376,42 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
                          uint64_t shared_pack_hash) : capacity(bytes) {
     if (bytes == 0) return;
+#if !defined(_WIN32)
+    // bloom (POWER9 + V100, access-counter migration on): memory registered with cudaHostRegister reads at 1-25 GB/s,
+    // DMA and in place, the larger the worse; cudaHostAlloc's at 68-72 at any size.  So the arena is the driver's,
+    // allocated by a thread on the NUMA node of the GPU it is for (the driver puts it on the allocating thread's
+    // node).  STRATA_ARENA_HOSTALLOC=0: the registered mapping below, as before.
+    const char* ha = std::getenv("STRATA_ARENA_HOSTALLOC");
+    if (shared_file.empty() && (ha == nullptr || std::string(ha) != "0")) {
+        int dev = 0;
+        (void) cudaGetDevice(&dev);
+        const int want = current_gpu_node();
+        void* p = nullptr;
+        std::thread([&] {
+            cpu_set_t set;
+            if (node_cpus(want, set)) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+            (void) cudaSetDevice(dev);
+            if (cudaHostAlloc(&p, (size_t) bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+                (void) cudaGetLastError();
+                p = nullptr;
+            }
+        }).join();
+        if (p != nullptr) {
+            base = p;
+            backing = PageBacking::PinnedByCuda;
+            node = want;
+            registered_bytes = bytes;
+            note = "cudaHostAlloc (page-locked by the driver) on NUMA node " + std::to_string(want);
+            std::lock_guard<std::mutex> lk(g_arenas_mu);
+            g_arenas.push_back({(const uint8_t*) p, (const uint8_t*) p + bytes, want});
+            return;
+        }
+        note = "cudaHostAlloc refused; ";
+    }
+#endif
+    std::string why = note;
     base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    note = why + note;
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -392,6 +506,18 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
 }
 
 PinnedArena::~PinnedArena() {
+#if !defined(_WIN32)
+    if (base && backing == PageBacking::PinnedByCuda) {
+        {
+            std::lock_guard<std::mutex> lk(g_arenas_mu);
+            for (size_t i = 0; i < g_arenas.size(); ++i)
+                if (g_arenas[i].begin == (const uint8_t*) base) { g_arenas.erase(g_arenas.begin() + (ptrdiff_t) i); break; }
+        }
+        cudaFreeHost(base);
+        base = nullptr;
+        return;
+    }
+#endif
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
@@ -494,9 +620,9 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
         copy_ns_sum.fetch_add(copy_ns);
     };
 
+    // every worker on its own thread, on the arena's node (run_on_arena_node): the caller keeps its affinity
     std::vector<std::thread> pool;
-    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
-    worker();
+    for (int i = 0; i < threads; ++i) pool.emplace_back([&] { run_on_arena_node(dst); worker(); });
     for (auto& t : pool) t.join();
 
     if (!err.empty()) {

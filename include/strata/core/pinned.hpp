@@ -14,6 +14,8 @@
 //     fallback is the common case and not an error path.
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -27,10 +29,21 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 /// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
 int arena_pin_cap_gib();
 
+/// The calling thread onto the CPUs of the NUMA node that holds `p`, when `p` is in an expert arena this process
+/// allocated with cudaHostAlloc (PinnedArena below; Linux).  The arena's loaders call it: on a POWER9 a GPU reads
+/// memory the other socket's CPUs wrote at 45 GB/s, its own socket's at 68 - with the pages on its node either way.
+void run_on_arena_node(const void* p);
+
+/// cudaHostAlloc made by a thread on the NUMA node of the current CUDA device (Linux; elsewhere a plain
+/// cudaHostAlloc): the driver puts page-locked memory on the allocating thread's node, and a GPU reads the other
+/// socket's memory at 40 GB/s on the AC922 against 68 from its own.  For a layer split's per-GPU host buffers.
+cudaError_t cuda_host_alloc_near_gpu(void** p, size_t bytes, unsigned int flags);
+
 struct PinnedArena {
     void* base = nullptr;
     uint64_t capacity = 0;
     PageBacking backing = PageBacking::NormalPages;
+    int node = -1;                 ///< PinnedByCuda: the NUMA node of the GPU it was allocated for
     std::string note;              // why the backing is what it is, for the startup print
     uint64_t locked_bytes = 0;     // resident via the working-set lock when CUDA could not pin it
     /// Plan v0.3 P5: when the whole arena cannot be registered, it is registered in `slice`-byte pieces from the

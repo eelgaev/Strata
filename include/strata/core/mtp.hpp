@@ -147,6 +147,10 @@ private:
     uint16_t* f16_ = nullptr;                                  ///< STRATA_FP16_MTP=1: FP16 copies, see tensor_f16
     std::vector<std::pair<std::string, size_t>> f16_off_;      ///< name -> element offset in f16_
     uint8_t* experts_ = nullptr;
+    /// STRATA_MTP_EXPERTS=<file>: the experts in the native GGUF layout (gate/up and down ggml types; -1 = the pack's
+    /// Q2_0 blobs) and the bytes per expert
+    int xgu_ = -1, xd_ = -1;
+    uint64_t xblob_ = 0;
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;

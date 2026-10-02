@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 
@@ -112,10 +113,17 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
+    /// Wait until this stage's downstream calls (and theirs) have finished; the first stage's `run` does it before it
+    /// returns.  A later stage's `run` (one chunk) returns once its own chunk is handed on, so every stage of a chain of
+    /// 3+ works on its own chunk at once instead of each waiting for the whole chain below it.
+    bool drain(std::string& err);
 
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
+    std::future<bool> next_run_;        ///< the next stage's run of the chunk last handed on (across calls)
+    std::string next_err_;
+    int hand_buf_ = 0;                  ///< which of the two hand-off buffers the next chunk is copied into
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)

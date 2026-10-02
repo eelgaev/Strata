@@ -1165,6 +1165,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (c0 + m.T < n) {
                 cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                    strata::platform::release_inherited_pin();
                     return ple_gather(c1, b, ple_next_err);
                 });
             }
@@ -1934,6 +1935,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_->hand_in_ = h;
             next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                strata::platform::release_inherited_pin();   // a new thread starts on the host thread core (CPU 0)
                 return next_->run(tokens + c0, T, p0, next_err_);
             });
             hand_buf_ ^= 1;

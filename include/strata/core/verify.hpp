@@ -223,6 +223,10 @@ private:
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    // the PCIe share's copy kernel on its own stream beside the VRAM experts (STRATA_FETCH_OVERLAP, default on)
+    cudaStream_t fetch_s_ = nullptr;
+    cudaEvent_t ev_plan_ = nullptr, ev_fetched_ = nullptr;
+    bool fetch_overlap_ = false;
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);

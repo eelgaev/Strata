@@ -217,11 +217,24 @@ __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __rest
 
 __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
                                    uint4* __restrict__ dst, long long per) {
+    // four independent 16-byte loads in flight per thread before their stores: the link's latency is covered with
+    // fewer blocks, which leaves SMs to the VRAM experts running beside this copy (STRATA_FETCH_BLOCKS)
     const long long total = (long long) *n * per;
-    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
-         i += (long long) gridDim.x * blockDim.x) {
-        const long long k = i / per, off = i - k * per;
-        dst[i] = ((const uint4*) src[k])[off];
+    const long long S = (long long) gridDim.x * blockDim.x;
+    long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    for (; i + 3 * S < total; i += 4 * S) {
+        uint4 v[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const long long j = i + u * S, k = j / per;
+            v[u] = ((const uint4*) src[k])[j - k * per];
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) dst[i + u * S] = v[u];
+    }
+    for (; i < total; i += S) {
+        const long long k = i / per;
+        dst[i] = ((const uint4*) src[k])[i - k * per];
     }
 }
 
@@ -308,7 +321,17 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
-    fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    static const unsigned blocks = [] {
+        const char* v = std::getenv("STRATA_FETCH_BLOCKS");
+        const int x = v ? std::atoi(v) : 0;
+        return x > 0 && x <= 4096 ? (unsigned) x : 24u;   // 24 x 256 beside the VRAM experts (AC922, 2 GPUs: 43.7 ms/window vs 45.8)
+    }();
+    static const unsigned threads = [] {
+        const char* v = std::getenv("STRATA_FETCH_THREADS");
+        const int x = v ? std::atoi(v) : 0;
+        return x == 512 || x == 1024 ? (unsigned) x : 256u;
+    }();
+    fetch_blobs_kernel<<<blocks, threads, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
 

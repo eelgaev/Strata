@@ -177,6 +177,9 @@ Verifier::~Verifier() {
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
+    if (fetch_s_) { cudaStreamSynchronize(fetch_s_); cudaStreamDestroy(fetch_s_); }
+    if (ev_plan_) cudaEventDestroy(ev_plan_);
+    if (ev_fetched_) cudaEventDestroy(ev_fetched_);
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
@@ -347,6 +350,23 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
+    }
+    // The PCIe share's copy kernel (pcie_mode 2) reads the missed experts over the link into staging.  On its own
+    // stream it starts once the plan is in place and runs while the VRAM experts are computed, instead of after them:
+    // on an IBM AC922 with two GPUs (~5 missed experts per layer-window, ~5 ms of link time per stage-window) the
+    // two were 7.0 + 2.8 ms of a 22 ms stage, one after the other.  The PCIe groups wait for it.  The buffers are
+    // disjoint (staging and the plan's second pointer list vs the VRAM groups' outputs), and the next layer's fetch
+    // forks after this layer's PCIe groups on the compute stream.  STRATA_FETCH_OVERLAP=0: one stream, as before.
+    {
+        const char* v = std::getenv("STRATA_FETCH_OVERLAP");
+        fetch_overlap_ = v == nullptr || std::atoi(v) != 0;
+    }
+    if (fetch_overlap_ &&
+        (cudaStreamCreateWithFlags(&fetch_s_, cudaStreamNonBlocking) != cudaSuccess ||
+         cudaEventCreateWithFlags(&ev_plan_, cudaEventDisableTiming) != cudaSuccess ||
+         cudaEventCreateWithFlags(&ev_fetched_, cudaEventDisableTiming) != cudaSuccess)) {
+        (void) cudaGetLastError();
+        fetch_overlap_ = false;
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
@@ -758,16 +778,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
             }
         };
+        auto fetch = [&](cudaStream_t s) {
+            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, s);
+            else wait_flag_ge(m_flagB_, ring, s);              // the PCIe share is in staging (DMA) or mapped
+            if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, s);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), s);
+            }
+        };
+        const bool overlap = fetch_overlap_ && sink_.pcie_mode == 2;
+        if (overlap) {   // the fetch beside the VRAM experts (init: fetch_s_)
+            cudaEventRecord(ev_plan_, cs);
+            cudaStreamWaitEvent(fetch_s_, ev_plan_, 0);
+            fetch(fetch_s_);
+            cudaEventRecord(ev_fetched_, fetch_s_);
+        }
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-        else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
-        }
+        if (overlap) cudaStreamWaitEvent(cs, ev_fetched_, 0);
+        else fetch(cs);
         stamp(l, 21, grp);
         grouped(p_ptr2, p_start2, p_counts + 2);
         stamp(l, 22, grp);

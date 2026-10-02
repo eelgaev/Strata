@@ -739,8 +739,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     Impl& m = *impl_;
     static const bool off = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
     core::QsaState& st = mtp.kv_state_rw();
-    if (off || n <= 0 || m.g == nullptr || m.region == nullptr || st.kv_mode != 0 || st.kv_hybrid ||
-        mtp.device() != m.device)
+    // kv_mode 0 (every page resident) or 2 (the drafter's ring): kv_append writes the device rows through the page
+    // table (the ring's is block % n_slots) and the host copy at the absolute row, which kv_ring_restore reads back;
+    // a chunk is shorter than the ring, so it cannot overwrite its own cells
+    if (off || n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && st.kv_mode != 2) ||
+        st.kv_hybrid || mtp.device() != m.device)
         return false;
     const auto t0 = Clock::now();
     const core::ModelGeometry& g = *m.g;
@@ -804,6 +807,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
+    if (st.kv_mode == 2 && n - r0 > st.n_slots * s.page_size) return false;   // longer than the ring: token path
     std::vector<int32_t> tk((size_t) B);
     if (q8) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();

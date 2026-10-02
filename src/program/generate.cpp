@@ -4492,8 +4492,12 @@ int main(int argc, char** argv) {
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
-            // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            // E-9: batched through the prompt path when it can.  A layer split moves this callback to the last stage
+            // (below), whose prompt path is on the drafter's GPU and idle here (its chunk is done): batch through it
+            // (STRATA_MTP_BATCH_SPLIT=0: the token path, as before)
+            static const bool split_batch = [] { const char* v = std::getenv("STRATA_MTP_BATCH_SPLIT"); return !v || v[0] != '0'; }();
+            strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;
+            const bool batched = (!multi_gpu || split_batch) && dsp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",

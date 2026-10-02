@@ -341,10 +341,15 @@ size_t gr_workspace_init(const GrShapes& s, void* base, GrWorkspace& out) {
     return bytes;
 }
 
-void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
-             const uint16_t* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed,
-             float* inject, void* stream) {
+void gr_read(const float* R, const float* w_norm, const void* w_down_v, const void* w_up_v,
+             const void* w_inject_v, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed,
+             float* inject, void* stream, WForm f_down_up, WForm f_inject) {
     if (s.n_embd <= 0 || s.hc <= 0 || s.hc_lr <= 0) return;
+    const uint16_t* w_down = (const uint16_t*) w_down_v;
+    const uint16_t* w_up = (const uint16_t*) w_up_v;
+    const uint16_t* w_inject = (const uint16_t*) w_inject_v;
+    if ((f_down_up != WForm::Bf16 || (w_inject != nullptr && f_inject != WForm::Bf16)) && !native_mmvf)
+        throw std::invalid_argument("gr_read: FP16/F32 weights (STRATA_FP16=load) need the native MMVF read");
     if (ws.xn == nullptr || ws.xq == nullptr || ws.lq == nullptr || ws.gated == nullptr || ws.lo == nullptr) {
         std::fprintf(stderr, "gr_read: GrWorkspace is not initialised (see gr_workspace_init)\n");
         std::exit(1);
@@ -365,9 +370,9 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
         if ((hc_dim & 1) != 0 || (hc_lr & 1) != 0)
             throw std::invalid_argument("gr_read native MMVF requires even hc*n_embd and hc_lr");
         native_gr_rms_norm_weighted(R, w_norm, ws.xn, n_embd, hc, eps, stream);
-        bf16_gemv_fp32_mmvf(ws.xn, w_down, ws.lo, hc_dim, hc_lr, stream);
+        gemv_fp32_mmvf(ws.xn, w_down, f_down_up, ws.lo, hc_dim, hc_lr, stream);
         native_gr_down_silu(ws.lo, hc_lr, hc, stream);
-        bf16_gemv_fp32_mmvf(ws.lo, w_up, ws.gated, hc_lr, hc_dim, stream);
+        gemv_fp32_mmvf(ws.lo, w_up, f_down_up, ws.gated, hc_lr, hc_dim, stream);
         // The existing null-injection contract identifies the final mixer.
         // Pinned qwen4exp uses fused HC pre for layers and the unfused graph for il=-1.
         native_gr_pre_gated(ws.xn, ws.gated, mixed, n_embd, hc, w_inject != nullptr, stream);
@@ -389,7 +394,7 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
     if (w_inject != nullptr) {
         const int nthreads = 32 * hc;
         if (use_native)
-            bf16_gemv_fp32_mmvf(ws.xn, w_inject, inject, hc_dim, hc, stream);
+            gemv_fp32_mmvf(ws.xn, w_inject, f_inject, inject, hc_dim, hc, stream);
         else if (use_fp32)
             gr_inject_kernel<float><<<1, nthreads, 0, st>>>(ws.xn, w_inject, hc_dim, hc, inject);
         else

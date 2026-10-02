@@ -29,6 +29,10 @@ public:
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
               float beta = 0.0f);
 
+    /// Y = X . W^T with both in FP32 (STRATA_FP16=load: the F32 gates).
+    void f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
+             float beta = 0.0f);
+
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);

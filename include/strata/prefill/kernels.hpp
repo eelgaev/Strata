@@ -12,13 +12,26 @@
 
 namespace strata::prefill {
 
-/// STRATA_PREFILL_F16: the BF16-weight projections (hyper-connection, router, shared gate, SSM alpha/beta, indexer,
-/// PLE key/value, the draft layer's) run as FP16 GEMMs; V100 has no BF16 tensor cores (cuBLAS BF16 is 3-18x slower
-/// there).  The weights are converted BF16 -> FP16 per GEMM (exact for these: |w| <= 8.6; values below 6.1e-5 become
-/// FP16 subnormals).  The "BF16 images" below are then FP16 bits.  1 = the BF16-rounded activation in FP16 (the same
-/// products as BF16; only cuBLAS's summation order differs); 2 = the activation rounded straight to FP16 (3 more
-/// mantissa bits).  0 (the default: opt-in, it can change the prompt path's numbers) = BF16 as before.
+/// The 16-bit "BF16 images" below, by STRATA_FP16 (strata/core/fp16_mode.hpp): 0 = BF16 (off, the default);
+/// 1 = the BF16-rounded activation in FP16 bits (prefill: the BF16 weights are converted to FP16 per GEMM, so the
+/// products are BF16's and only cuBLAS's summation order differs); 2 = the activation rounded straight to FP16 (load:
+/// the weights are FP16 from the GGUF).  Both FP16 forms saturate at +-65504.
 int prefill_f16_mode();
+/// While alive (this thread): BF16 images whatever STRATA_FP16 says - for the weights that stay BF16 under
+/// STRATA_FP16=load (the MTP drafter's, a BF16 PLE key).
+class Bf16Images {
+public:
+    Bf16Images();
+    ~Bf16Images();
+    Bf16Images(const Bf16Images&) = delete;
+    Bf16Images& operator=(const Bf16Images&) = delete;
+private:
+    int prev_;
+};
+/// STRATA_FP16=load, F32 inject weights: inj[t*4 + o] = sum_j xn[t, j] * w[o*10240 + j] in FP32, with xn recomputed
+/// from R, the row scales rs and the norm weights exactly as gr_mix_r does (no 16-bit image).
+void gr_inject_f32(const float* R, const float* rs, const float* w_norm, const float* w_inject, float* inj, int64_t T,
+                   void* stream);
 
 // ---- hyper-connection (n_embd 2560, hc 4, hc_lr 320)
 /// xn[t, c*2560 + d] = R[t,c,d] * rsqrt(mean_d R[t,c,:]^2 + eps) * w_norm[c*2560 + d]; also its BF16 image.

@@ -5,6 +5,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -67,8 +68,27 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
     hist[c * 3 + 2] = seq[2];
 }
 
-__global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
-                                                           const uint16_t* __restrict__ wb,
+// 8 weights of row `base` (16-byte chunk j of a 16-bit row; 32 bytes of an F32 one), widened to FP32
+template <int WF>
+__device__ __forceinline__ void wload8(const void* base, int j, float* w) {
+    if constexpr (WF == 2) {
+        const float4* p = reinterpret_cast<const float4*>(base) + 2 * j;
+        const float4 a = __ldg(p), b = __ldg(p + 1);
+        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w; w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+    } else {
+        const uint4 v = __ldg(reinterpret_cast<const uint4*>(base) + j);
+        const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            if constexpr (WF == 0) { w[2 * k] = __uint_as_float(u[k] << 16); w[2 * k + 1] = __uint_as_float(u[k] & 0xffff0000u); }
+            else { w[2 * k] = __half2float(__ushort_as_half((uint16_t) u[k])); w[2 * k + 1] = __half2float(__ushort_as_half((uint16_t) (u[k] >> 16))); }
+        }
+    }
+}
+
+template <int WF>
+__global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restrict__ x, const void* __restrict__ wa,
+                                                           const void* __restrict__ wb,
                                                            const float* __restrict__ dt,
                                                            const float* __restrict__ ssm_a, float* __restrict__ gate,
                                                            float* __restrict__ beta, int n, int h_v, int T) {
@@ -76,12 +96,13 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
     if (row >= 2 * h_v) return;
     const bool is_beta = row >= h_v;
     const int r = is_beta ? row - h_v : row;
-    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
+    const void* wrow = reinterpret_cast<const char*>(is_beta ? wb : wa) + (size_t) r * n * (WF == 2 ? 4 : 2);
     float acc[kVerifyMaxT];
 #pragma unroll
     for (int t = 0; t < kVerifyMaxT; ++t) acc[t] = 0.0f;
     for (int j = lane; j < n / 8; j += 32) {
-        const uint4 wv = __ldg(w4 + j);
+        float w[8];
+        wload8<WF>(wrow, j, w);
 #pragma unroll
         for (int t = 0; t < kVerifyMaxT; ++t) {
             if (t >= T) break;
@@ -89,10 +110,10 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
             const float4 xa = *reinterpret_cast<const float4*>(xt + j * 8);
             const float4 xb = *reinterpret_cast<const float4*>(xt + j * 8 + 4);
             float a = acc[t];
-            a = fmaf(__uint_as_float(wv.x << 16), xa.x, a); a = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, a);
-            a = fmaf(__uint_as_float(wv.y << 16), xa.z, a); a = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, a);
-            a = fmaf(__uint_as_float(wv.z << 16), xb.x, a); a = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, a);
-            a = fmaf(__uint_as_float(wv.w << 16), xb.z, a); a = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, a);
+            a = fmaf(w[0], xa.x, a); a = fmaf(w[1], xa.y, a);
+            a = fmaf(w[2], xa.z, a); a = fmaf(w[3], xa.w, a);
+            a = fmaf(w[4], xb.x, a); a = fmaf(w[5], xb.y, a);
+            a = fmaf(w[6], xb.z, a); a = fmaf(w[7], xb.w, a);
             acc[t] = a;
         }
     }
@@ -517,14 +538,19 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
     check("gdn_conv_commit");
 }
 
-void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
-                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+void gdn_ab_multi(const float* x, const void* w_alpha, const void* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream, WForm form) {
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
-        x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    const unsigned blocks = (unsigned) ((2 * h_v + 7) / 8);
+    if (form == WForm::Bf16)
+        gdn_ab_multi_kernel<0><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    else if (form == WForm::F16)
+        gdn_ab_multi_kernel<1><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    else
+        gdn_ab_multi_kernel<2><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     check("gdn_ab_multi");
 }
 

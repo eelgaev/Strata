@@ -50,6 +50,8 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/core/fp16_mode.hpp"
+#include "strata/core/load_converted.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -697,6 +699,7 @@ struct GpuStage {
     double pcie_frac = 0.0;
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
+    std::vector<void*> converted;   ///< STRATA_FP16=load: its copies of the converted weights
     strata::core::NativeHead head;
     strata::core::SessionState ss;
     cudaStream_t stream = nullptr;
@@ -1934,6 +1937,27 @@ int main(int argc, char** argv) {
         }
         if (native_pack) skip.insert("token_embd.weight");
     }
+    // STRATA_FP16=load: the BF16-form weights come from the GGUF (FP16; the gates F32), so the pack's rows are skipped
+    strata::core::LoadConverted converted;
+    std::vector<void*> converted_main;
+    if (strata::fp16_mode() == strata::Fp16Mode::Load) {
+        if (o.native_shards.empty()) {
+            std::fprintf(stderr, "strata generate: STRATA_FP16=load reads the weights from the GGUF: it needs --native\n");
+            return 1;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!converted.build(o.native_shards, strata::fp16_gates(), err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        converted.served_names(skip);
+        std::fprintf(stderr, "strata generate: STRATA_FP16=load: %zu tensors as FP16, %zu gates as F32%s, %.1f MiB, from "
+                             "the GGUF in %.1f s (%llu values became FP16 subnormals, %llu became zero)\n",
+                     converted.tensors_f16, converted.tensors_f32, strata::fp16_gates() ? " (STRATA_FP16_GATES=1)" : "",
+                     (double) converted.bytes / 1048576.0,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                     (unsigned long long) converted.subnormal, (unsigned long long) converted.flushed);
+    }
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -1962,6 +1986,10 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights\n",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0));
+    }
+    if (strata::fp16_mode() == strata::Fp16Mode::Load && !converted.attach(wt, converted_main, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
     }
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
@@ -2138,6 +2166,7 @@ int main(int argc, char** argv) {
             ss.ple.w.key_native_q8_1 = wk->native_q8_1;
         }
         ss.ple.w.value_bf16 = (const uint16_t*) wv->data;
+        ss.ple.w.value_f16 = wv->kind == strata::core::WeightKind::F16InF32;
         ss.ple.w.norm_key = (const float*) wnk->data;
         ss.ple.w.norm_query = (const float*) wnq->data;
         ss.ple.w.norm_conv = (const float*) wnc->data;
@@ -2254,6 +2283,10 @@ int main(int argc, char** argv) {
         if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
+            return 1;
+        }
+        if (strata::fp16_mode() == strata::Fp16Mode::Load && !converted.attach(st.wt, st.converted, err)) {
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %s\n", st.dev, err.c_str());
             return 1;
         }
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its

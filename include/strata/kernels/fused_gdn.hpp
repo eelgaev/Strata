@@ -12,6 +12,8 @@
 //   y  = rmsnorm(o) * gamma * sigmoid(z)
 #pragma once
 
+#include "strata/kernels/bf16_gemv.hpp"
+
 #include <cstdint>
 
 namespace strata::kernels {
@@ -25,8 +27,8 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
 /// alpha and beta, both `(h_v, n_embd)` BF16 against the FP32 activation, with their epilogues:
 /// gate = softplus(alpha + dt) * ssm_a,  beta = sigmoid(beta).  One warp per row; replaces two MMVF launches and
 /// two elementwise kernels.
-void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
-                  float* gate, float* beta, int n_embd, int h_v, void* stream);
+void fused_gdn_ab(const float* x, const void* w_alpha, const void* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, void* stream, WForm form = WForm::Bf16);
 
 void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,

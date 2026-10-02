@@ -1,5 +1,6 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+#include "strata/core/weight_form.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -91,11 +92,15 @@ constexpr int TPR = 32;
 bool native_bf16_projections = false;
 bool native_flash_attn_short = false;
 
-void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weights, float* out,
-                  int64_t n_in, int64_t n_out, bool split, void* stream) {
+void project_bf16(const float* x, const uint16_t* x_bf16, const void* weights_v, float* out,
+                  int64_t n_in, int64_t n_out, bool split, void* stream,
+                  strata::kernels::WForm form = strata::kernels::WForm::Bf16) {
     using namespace strata::kernels;
-    if (native_bf16_projections) bf16_gemv_fp32_mmvf(x, weights, out, n_in, n_out, stream);
-    else if (split) bf16_gemv_split(x_bf16, weights, out, n_in, n_out, TPR, stream);
+    const uint16_t* weights = (const uint16_t*) weights_v;
+    if (native_bf16_projections) { gemv_fp32_mmvf(x, weights_v, form, out, n_in, n_out, stream); return; }
+    if (form != WForm::Bf16)
+        throw std::invalid_argument("project_bf16: FP16/F32 weights (STRATA_FP16=load) need the native BF16 projections");
+    if (split) bf16_gemv_split(x_bf16, weights, out, n_in, n_out, TPR, stream);
     else bf16_gemv(x_bf16, weights, out, n_in, n_out, stream);
 }
 ///< threads per row for the row-split GEMVs.
@@ -284,12 +289,12 @@ st_end(layer, 11, stream);
 //         36 GDN layers.
 st_begin(layer, 12, stream);
     if (fused_pre) {
-        fused_gdn_ab(mixed, (const uint16_t*) w_alpha->data, (const uint16_t*) w_beta->data, dt, ssm_a, b.gate, b.beta,
-                     (int) g.n_embd, (int) g.ssm_v_heads, stream);
+        fused_gdn_ab(mixed, w_alpha->data, w_beta->data, dt, ssm_a, b.gate, b.beta,
+                     (int) g.n_embd, (int) g.ssm_v_heads, stream, wform(w_alpha, "ssm_alpha.weight"));
     } else {
     if (!native_bf16_projections) f32_to_bf16_bulk(mixed, b.x_bf16, g.n_embd, stream);
-    project_bf16(mixed, b.x_bf16, (const uint16_t*) w_alpha->data, b.alpha, g.n_embd, g.ssm_v_heads, true, stream);
-    project_bf16(mixed, b.x_bf16, (const uint16_t*) w_beta->data, b.beta, g.n_embd, g.ssm_v_heads, true, stream);
+    project_bf16(mixed, b.x_bf16, w_alpha->data, b.alpha, g.n_embd, g.ssm_v_heads, true, stream, wform(w_alpha, "ssm_alpha.weight"));
+    project_bf16(mixed, b.x_bf16, w_beta->data, b.beta, g.n_embd, g.ssm_v_heads, true, stream, wform(w_beta, "ssm_beta.weight"));
     }
     if (!fused_pre) try {
         if (native_gdn_enabled()) {
@@ -364,7 +369,7 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 //      memory-bound floor and the largest single item left inside the MoE after the top-10 was fixed.
 //      `bf16_gemv_split` exists for precisely this case; its own header says so.  Measured here:
 //      LEDGER L41 -> L42.
-project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+project_bf16(x, b.x_bf16, w_router->data, b.logits, g.n_embd, g.n_expert, true, stream, wform(w_router, "ffn_gate_inp.weight"));
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
 if (native_router_enabled() && g.n_expert == 512 && k == 10) {
@@ -394,7 +399,7 @@ SForm f_gate, f_up, f_down;    if (!sform_of(*w_sgate, f_gate, v.name("ffn_gate_
 // re-rounded it to the engine form like any other BF16 tensor.  Reading it as f32 is 5120 bytes past the
 // end of a 5120-byte tensor inside a 4.5 GiB arena, where nothing faults.  Refuse here rather than trust
 // the layout check to have run: this function is reachable without it.
-if (w_ginp->kind != WeightKind::Bf16InF32) {        err = v.name("ffn_gate_inp_shexp.weight") + " is engine form " +              std::to_string((int) w_ginp->kind) + " (" + std::to_string(w_ginp->bytes) +              " B); the scalar gate reads it as bf16, so it must be form 1 (" +              std::to_string((uint64_t) g.n_embd * 2) + " B)";        return false;    }
+if (w_ginp->kind != WeightKind::Bf16InF32 && w_ginp->kind != WeightKind::F16InF32 && w_ginp->kind != WeightKind::F32) {        err = v.name("ffn_gate_inp_shexp.weight") + " is engine form " +              std::to_string((int) w_ginp->kind) + " (" + std::to_string(w_ginp->bytes) +              " B); the scalar gate reads it as bf16, so it must be form 1 (" +              std::to_string((uint64_t) g.n_embd * 2) + " B)";        return false;    }
 // THE SHARED EXPERT'S WEIGHTS ARE NOT ONE FAMILY: `ffn_gate_shexp` is Q2_0 on 21 layers and a K-quant on
 // the rest, `ffn_up_shexp` Q2_0 on 13, and `ffn_down_shexp` is LEGACY in every layer (IQ4_NL/Q4_0/Q5_0/
 // Q8_0/Q2_0, `n_in` 640 so Q8_K is impossible).  So BOTH quantized images of the activation are produced
@@ -414,8 +419,8 @@ f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
     try {
         shared_expert(b.x_q8_0, b.x_q8k, b.x_bf16, f_gate, p_gate.codes, p_gate.scales, p_gate.offset,
                       f_up, p_up.codes, p_up.scales, p_up.offset, f_down, p_down.codes, p_down.scales,
-                      p_down.offset, (const uint16_t*) w_ginp->data, b.sh_scratch, b.shared,
-                      g.n_embd, g.n_ff, /*tpr=*/32, stream, x, &native);
+                      p_down.offset, w_ginp->data, b.sh_scratch, b.shared,
+                      g.n_embd, g.n_ff, /*tpr=*/32, stream, x, &native, wform(w_ginp, "ffn_gate_inp_shexp.weight"));
     } catch (const std::exception& error) {
         err = v.name("shared_expert") + ": " + error.what();
         return false;
@@ -863,7 +868,7 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
 struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");    const WeightRef* w_attnq = v.get("attn_q.weight");    const WeightRef* w_attnk = v.get("attn_k.weight");    const WeightRef* w_attnv = v.get("attn_v.weight");    const WeightRef* w_attno = v.get("attn_output.weight");    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");    const WeightRef* w_qn = v.get("attn_q_norm.weight");    const WeightRef* w_kn = v.get("attn_k_norm.weight");    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");    const char* missing = !w_idxk ? "indexer.k_proj.weight" : !w_attnq ? "attn_q.weight"                          : !w_attnk ? "attn_k.weight" : !w_attnv ? "attn_v.weight"                          : !w_attno ? "attn_output.weight" : !w_idxq ? "indexer.q_proj.weight"                          : !w_qn ? "attn_q_norm.weight" : !w_kn ? "attn_k_norm.weight"                          : !w_iqn ? "indexer.q_norm.weight" : !w_ikn ? "indexer.k_norm.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }    if (pos < 0 || pos >= st.max_cells) {        err = "qsa_layer: pos " + std::to_string(pos) + " is outside the state's 0.." +              std::to_string(st.max_cells - 1);        return false;    }
 // THE TWO BF16 PROJECTIONS: the arena holds them re-rounded to 2 B/elem, which is what `bf16_gemv` wants.
 // Reading one as f32 would walk 2x its length inside the arena without faulting.
-if (w_idxk->kind != WeightKind::Bf16InF32 || w_idxq->kind != WeightKind::Bf16InF32) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }
+if ((w_idxk->kind != WeightKind::Bf16InF32 && w_idxk->kind != WeightKind::F16InF32) || (w_idxq->kind != WeightKind::Bf16InF32 && w_idxq->kind != WeightKind::F16InF32)) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }
 // ---- 1. the three activation formats, once each
 if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
         quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
@@ -887,7 +892,7 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
         } else
         if (cudaMemcpyAsync(st.step, st.host_step, qsa_step_bytes(), cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(st.pos_dev, st.host_pos, (size_t) g.n_head * 4, cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
 // ---- 3. the indexer's RAW key: appended before any norm, pooled later once per block
-project_bf16(x, b.x_bf16, (const uint16_t*) w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, false, stream);
+project_bf16(x, b.x_bf16, w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, false, stream, wform(w_idxk, "indexer.k_proj.weight"));
 // ---- 4. K and V, in Q8_K, then norm and rotate K only
 SForm f_k, f_v, f_o, f_q;    if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"), err)) return false;    if (!sform_of(*w_attnv, f_v, v.name("attn_v.weight"), err)) return false;    if (!sform_of(*w_attno, f_o, v.name("attn_output.weight"), err)) return false;    if (!sform_of(*w_attnq, f_q, v.name("attn_q.weight"), err)) return false;    Planes p_k, p_v, p_o, p_q;    if (!plane_ptrs(*w_attnk, v.name("attn_k.weight"), p_k, err)) return false;    if (!plane_ptrs(*w_attnv, v.name("attn_v.weight"), p_v, err)) return false;    if (!plane_ptrs(*w_attno, v.name("attn_output.weight"), p_o, err)) return false;    if (!plane_ptrs(*w_attnq, v.name("attn_q.weight"), p_q, err)) return false;
 // k and v, with the activation THIS layer's tensors ask for.  Both are K-quants in every QSA layer of this
@@ -931,7 +936,7 @@ if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g
 // case A) and needs no kernel.
 if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4,                          (size_t) g.head_dim * 4, (size_t) g.n_head, cudaMemcpyDeviceToDevice,                          (cudaStream_t) stream) != cudaSuccess) {        err = "qsa_layer: the q/gate split failed";        return false;    }    if (!normalize_rotate(b.qcur, w_qn, (int) g.n_head, (int) g.head_dim)) return false;
 // ---- 7. the indexer's query: BF16, then norm and rotate
-project_bf16(x, b.x_bf16, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream);
+project_bf16(x, b.x_bf16, w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream, wform(w_idxq, "indexer.q_proj.weight"));
 if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim)) return false;
 // ---- 8. score, select, gather, attend.  `max_blocks` and `cap` are CAPACITIES from the state, not this
 // token's counts: a grid or a shared-memory size that follows the sequence length is baked into a captured
@@ -1066,15 +1071,16 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
         err = "lm_head: an output_hc_* weight is missing";
         return false;
     }
-    if (wn->kind != WeightKind::F32 || wd->kind != WeightKind::Bf16InF32 ||
-        wu->kind != WeightKind::Bf16InF32) {
+    if (wn->kind != WeightKind::F32 || wd->kind != wu->kind ||
+        (wd->kind != WeightKind::Bf16InF32 && wd->kind != WeightKind::F16InF32)) {
         err = "lm_head: the output_hc_* weights have the wrong engine forms";
         return false;
     }
     const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    strata::kernels::gr_read(bb.R, (const float*) wn->data, (const uint16_t*) wd->data,
-                            (const uint16_t*) wu->data, nullptr, RMS_EPS, gs, bb.gr,
-                            bb.mixed, bb.inject, stream);
+    try {
+        strata::kernels::gr_read(bb.R, (const float*) wn->data, wd->data, wu->data, nullptr, RMS_EPS, gs, bb.gr,
+                                bb.mixed, bb.inject, stream, wform(wd, "output_hc_down.weight"));
+    } catch (const std::exception& e) { err = std::string("lm_head: ") + e.what(); return false; }
     return true;
 }
 
@@ -1203,7 +1209,7 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
 const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
 // The GR weights are BF16 and the arena holds them re-rounded to 2 B/elem.  `gr_read` wants exactly
 // that; handing it f32 bytes would walk 2x the tensor inside the arena without faulting.
-if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
+const bool bf_ = w_down[h]->kind == WeightKind::Bf16InF32 && w_up[h]->kind == WeightKind::Bf16InF32 && w_inject[h]->kind == WeightKind::Bf16InF32;        const bool ld_ = w_down[h]->kind == WeightKind::F16InF32 && w_up[h]->kind == WeightKind::F16InF32 && (w_inject[h]->kind == WeightKind::F16InF32 || w_inject[h]->kind == WeightKind::F32);        if ((!bf_ && !ld_) || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
 // ---- half 1: the mixer
 float* R = bb.R;
     // R0.11: WHICH STAGES TO RUN.  `stage_prefix == 0` means "as `half` says", so every caller that predates
@@ -1222,9 +1228,17 @@ st_begin(layer, 0, stream);
         fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = (const uint16_t*) w_down[0]->data;
         fa.w_up = (const uint16_t*) w_up[0]->data; fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
+        fa.w_f16 = w_down[0]->kind == WeightKind::F16InF32;
+        if (w_inject[0]->kind == WeightKind::F32) {
+            // STRATA_FP16=load: the one-token multi read leaves its FP32 normalized rows in bb.gr.xn for the F32 inject
+            fa.w_inject = nullptr;
+            strata::kernels::fused_gr_read_multi(&fa, 1, bb.gr.xn, stream);
+            strata::kernels::gemv_fp32_mmvf(bb.gr.xn, w_inject[0]->data, strata::kernels::WForm::F32, bb.inject,
+                                            g.hc * g.n_embd, g.hc, stream);
+        } else
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    gr_read(R, (const float*) w_norm[0]->data, (const uint16_t*) w_down[0]->data,            (const uint16_t*) w_up[0]->data, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    gr_read(R, (const float*) w_norm[0]->data, w_down[0]->data,            w_up[0]->data, w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream, wform(w_down[0], "hc down"), wform(w_inject[0], "hc inject"));
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
@@ -1245,9 +1259,17 @@ st_begin(layer, 3, stream);
         fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = (const uint16_t*) w_down[1]->data;
         fa.w_up = (const uint16_t*) w_up[1]->data; fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
+        fa.w_f16 = w_down[1]->kind == WeightKind::F16InF32;
+        if (w_inject[1]->kind == WeightKind::F32) {
+            // STRATA_FP16=load: the one-token multi read leaves its FP32 normalized rows in bb.gr.xn for the F32 inject
+            fa.w_inject = nullptr;
+            strata::kernels::fused_gr_read_multi(&fa, 1, bb.gr.xn, stream);
+            strata::kernels::gemv_fp32_mmvf(bb.gr.xn, w_inject[1]->data, strata::kernels::WForm::F32, bb.inject2,
+                                            g.hc * g.n_embd, g.hc, stream);
+        } else
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    gr_read(R, (const float*) w_norm[1]->data, (const uint16_t*) w_down[1]->data,            (const uint16_t*) w_up[1]->data, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    gr_read(R, (const float*) w_norm[1]->data, w_down[1]->data,            w_up[1]->data, w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream, wform(w_down[1], "hc down"), wform(w_inject[1], "hc inject"));
     }
     st_end(layer, 3, stream);        }
     if (run4) {

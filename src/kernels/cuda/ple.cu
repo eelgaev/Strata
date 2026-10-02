@@ -320,8 +320,9 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
 
     // The value projection's independent option leaves the nonlinear PLE operations unchanged.
     if (native_bf16) {
-        bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, stream);
+        gemv_fp32_mmvf(emb, w.value_bf16, w.value_f16 ? WForm::F16 : WForm::Bf16, d_value, n_embd, n_embd, stream);
     } else {
+        if (w.value_f16) throw std::invalid_argument("ple: an FP16 value (STRATA_FP16=load) needs the native projection");
         to_bf16_kernel<<<(n_embd + THREADS - 1) / THREADS, THREADS, 0, st>>>(emb, d_emb16, n_embd);
         bf16_gemv_kernel<<<(n_embd + THREADS - 1) / THREADS, THREADS, 0, st>>>(d_emb16, w.value_bf16, d_value,
                                                                               n_embd, n_embd);

@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/weight_form.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -557,12 +558,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
                 a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
                 a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
-                a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
+                a.w_up = (const uint16_t*) wu[half]->data;
+                // STRATA_FP16=load: FP16 down/up; an F32 inject runs after the read, on its FP32 normalized rows
+                a.w_f16 = wd[half]->kind == WeightKind::F16InF32;
+                a.w_inject = wi[half]->kind == WeightKind::F32 ? nullptr : (const uint16_t*) wi[half]->data;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
             }
             fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+            if (wi[half]->kind == WeightKind::F32)
+                gemv_fp32_mmvf_multi(xn_ + (size_t) tb * HC * N, HC * N, wi[half]->data, strata::kernels::WForm::F32,
+                                     inj_out + tb * HC, HC, HC * N, HC, n, cs);
         };
         gr_read_group(0, pending, inj2_, inj_);
         stamp(l, 1, grp);
@@ -591,9 +598,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 2, grp);
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
                 stamp(l, 3, grp);
-                gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                if (wa->kind != wb->kind) { err = "verify: ssm_alpha and ssm_beta are in different forms"; return false; }
+                gdn_ab_multi(xm, wa->data, wb->data, (const float*) wdt->data,
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
-                             n, cs);
+                             n, cs, wform(wa, "ssm_alpha.weight"));
                 stamp(l, 4, grp);
                 native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
@@ -627,9 +635,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
+                const strata::kernels::WForm fik = wform(wik, "indexer.k_proj.weight");
+                if (qb) gemv_fp32_mmvf_multi(mixed_ + tb * N, N, wik->data, fik, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                    gemv_fp32_mmvf(mixed_ + t * N, wik->data, fik, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
                 native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
@@ -676,7 +685,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
+                    gemv_fp32_mmvf_multi(mixed_ + tb * N, N, wiq->data, wform(wiq, "indexer.q_proj.weight"), qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
                 } else {
@@ -692,7 +701,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 for (int t = tb; t < te; ++t) {
                     float* qx = qidx_ + t * IQ * ID;
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
+                    gemv_fp32_mmvf(mixed_ + t * N, wiq->data, wform(wiq, "indexer.q_proj.weight"), qx, (int) N, (int) (IQ * ID), cs);
                     norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
                 }
                 }
@@ -735,7 +744,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
+                gemv_fp32_mmvf_multi(mixed_ + tb * N, N, w_router->data, wform(w_router, "ffn_gate_inp.weight"), logits_ + tb * NE, NE, N,
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
@@ -768,8 +777,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
             else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
             try {
-                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
-                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs);
+                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
+                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs, wform(wgi, "ffn_gate_inp_shexp.weight"));
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;

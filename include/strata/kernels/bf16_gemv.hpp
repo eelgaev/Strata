@@ -49,4 +49,12 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
 
+/// The stored form of a BF16-form weight: the pack's BF16, or under STRATA_FP16=load FP16 or F32 (the gates).
+enum class WForm : int { Bf16 = 0, F16 = 1, F32 = 2 };
+/// bf16_gemv_fp32_mmvf / _multi for a weight in form `f` (F32: w 8-byte aligned).  Bf16 is the same kernel and
+/// the same bits as the BF16 entry points; F16 and F32 widen each weight to FP32 and keep the order of operations.
+void gemv_fp32_mmvf(const float* x, const void* w, WForm f, float* y, int64_t n_in, int64_t n_out, void* stream);
+void gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const void* w, WForm f, float* y, int64_t ldy,
+                          int64_t n_in, int64_t n_out, int n_tok, void* stream);
+
 }  // namespace strata::kernels

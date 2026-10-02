@@ -14,6 +14,8 @@
 // contract. Optional native projection weights select the pinned CUDA Q8_1 MMVQ contract independently.
 #pragma once
 
+#include "strata/kernels/bf16_gemv.hpp"
+
 #include <cstdint>
 
 #include "strata/kernels/s_gemv.hpp"
@@ -64,17 +66,18 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                    const uint8_t* gate_codes, const float* gate_scales, const float* gate_off,
                    const SForm& up_form, const uint8_t* up_codes, const float* up_scales, const float* up_off,
                    const SForm& down_form, const uint8_t* down_codes, const float* down_scales,
-                   const float* down_off, const uint16_t* gate_inp_bf16, float* scratch, float* out,
+                   const float* down_off, const void* gate_inp_bf16, float* scratch, float* out,
                    int64_t n_embd, int64_t n_ff, int tpr, void* stream, const float* x_f32 = nullptr,
-                   const NativeSharedWeights* native = nullptr);
+                   const NativeSharedWeights* native = nullptr, WForm gate_inp_form = WForm::Bf16);
 
 /// Plan v0.3 P6: the shared expert for `n_tok` <= 8 tokens (a verify window) with all three projections native:
 /// multi-column MMVQ, so the weights are read once; every token is bitwise `shared_expert` on that token.
 /// `x` (n_tok, n_embd) f32, `x_bf16` the same rounded (only read when the native BF16 gate is off), `gate`/`up`
 /// (n_tok, n_ff) scratch, `g` n_tok floats, `out` (n_tok, n_embd).  `nw.q8_1` must hold n_tok columns of n_embd.
+/// `gate_inp_form`: the scalar gate's stored form (STRATA_FP16=load: F32 or FP16; those need the native gate).
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
-                         const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream);
+                         const void* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
+                         int64_t n_ff, void* stream, WForm gate_inp_form = WForm::Bf16);
 
 /// The MoE block's final combination, `ref/moe.py::moe` L156:
 ///

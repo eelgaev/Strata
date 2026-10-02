@@ -2,6 +2,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/core/fp16_mode.hpp"
 #include <cuda_fp16.h>
 
 #include <cublas_v2.h>
@@ -368,9 +369,10 @@ __global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ x, uint16_t* __r
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta) {
     if (T <= 0 || N <= 0) return;
-    if (strata::prefill::prefill_f16_mode() != 0) {
-        // X is already FP16 (the producers wrote FP16 images); W to FP16 here, every call: a weight's memory may be
-        // a staging buffer refilled under the same pointer (PLE), and the conversion is ~10 us per 6.5 MB weight.
+    if (strata::fp16_mode() == strata::Fp16Mode::Prefill) {
+        // STRATA_FP16=prefill: X is already FP16 (the producers wrote FP16 images); W to FP16 here, every call: a
+        // weight's memory may be a staging buffer refilled under the same pointer (PLE), and the conversion is
+        // ~10 us per 6.5 MB weight.
         const int64_t n = N * K;
         if (n > w16_elems_) {
             if (w16_) cudaFree(w16_);
@@ -400,6 +402,16 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx");
+}
+
+void Gemm::f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta) {
+    if (T <= 0 || N <= 0) return;
+    if (ldy <= 0) ldy = N;
+    const float alpha = 1.0f;
+    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                    CUDA_R_32F, (int) K, X, CUDA_R_32F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+       "cublasGemmEx f32");
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,

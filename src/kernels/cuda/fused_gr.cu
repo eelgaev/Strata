@@ -2,6 +2,8 @@
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+
+#include <cuda_fp16.h>
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -45,6 +47,21 @@ __device__ __forceinline__ float dot8(const uint4 w, const float* x) {
     }
     return acc;
 }
+
+// `dot8` for 8 FP16 weights (STRATA_FP16=load), the same fmaf order
+__device__ __forceinline__ float dot8h(const uint4 w, const float* x) {
+    float acc = 0.0f;
+    const uint32_t v[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        acc = fmaf(__half2float(__ushort_as_half((uint16_t) v[j])), x[2 * j], acc);
+        acc = fmaf(__half2float(__ushort_as_half((uint16_t) (v[j] >> 16))), x[2 * j + 1], acc);
+    }
+    return acc;
+}
+// the weight form is uniform over a launch: `h` is FusedGrArgs::w_f16
+__device__ __forceinline__ float dot8w(bool h, const uint4 w, const float* x) { return h ? dot8h(w, x) : dot8(w, x); }
+
 
 __global__ void __launch_bounds__(THREADS) gr_down_kernel(FusedGrArgs a) {
     __shared__ __align__(16) float xn[D];
@@ -93,7 +110,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_kernel(FusedGrArgs a) {
     const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
     float acc = 0.0f;
 #pragma unroll 4
-    for (int j = lane; j < D / 8; j += 32) acc += dot8(__ldg(w4 + j), xn + j * 8);
+    for (int j = lane; j < D / 8; j += 32) acc += dot8w(a.w_f16, __ldg(w4 + j), xn + j * 8);
     acc = warp_sum(acc);
     if (lane != 0) return;
     if (inject_block) {
@@ -115,8 +132,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
     for (int r = warp; r < HC * UP_COLS; r += WARPS) {
         const int c = r / UP_COLS, dd = r - c * UP_COLS, i = c * N + d0 + dd;
         const uint4* w4 = reinterpret_cast<const uint4*>(a.w_up + (size_t) i * LR);
-        float acc = dot8(__ldg(w4 + lane), lo + lane * 8);
-        if (lane < LR / 8 - 32) acc += dot8(__ldg(w4 + 32 + lane), lo + (32 + lane) * 8);
+        float acc = dot8w(a.w_f16, __ldg(w4 + lane), lo + lane * 8);
+        if (lane < LR / 8 - 32) acc += dot8w(a.w_f16, __ldg(w4 + 32 + lane), lo + (32 + lane) * 8);
         acc = warp_sum(acc);
         if (lane == 0) {
             float rv = a.R[i];
@@ -230,7 +247,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
             const int j = lane + 32 * q;
 #pragma unroll
             for (int k = 0; k < kFusedGrMaxT; ++k)
-                if (k < T) acc[k] += dot8(wv[q], tile + k * TILEV + j * 8);
+                if (k < T) acc[k] += dot8w(m.a[0].w_f16, wv[q], tile + k * TILEV + j * 8);
         }
     }
     if (!active) return;
@@ -283,8 +300,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
 #pragma unroll
         for (int k = 0; k < kFusedGrMaxT; ++k) {
             if (k >= T) break;
-            float acc = dot8(wa, lo[k] + lane * 8);
-            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            float acc = dot8w(m.a[0].w_f16, wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8w(m.a[0].w_f16, wb, lo[k] + (32 + lane) * 8);
             acc = warp_sum(acc);
             if (lane == k) mine = acc;
         }
@@ -392,7 +409,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_v3_kernel(GrMulti m, float* _
             const int j = lane + 32 * q;
 #pragma unroll
             for (int k = 0; k < kFusedGrMaxT; ++k)
-                if (k < T) acc[k] += dot8(wv[r][q], xs + (size_t) k * SL + j * 8);
+                if (k < T) acc[k] += dot8w(m.a[0].w_f16, wv[r][q], xs + (size_t) k * SL + j * 8);
         }
         const int prow = inject_block ? LR + warp : row0 + r;
 #pragma unroll
@@ -472,8 +489,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 #pragma unroll
         for (int k = 0; k < kFusedGrMaxT; ++k) {
             if (k >= T) break;
-            float acc = dot8(wa, lo[k] + lane * 8);
-            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            float acc = dot8w(m.a[0].w_f16, wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8w(m.a[0].w_f16, wb, lo[k] + (32 + lane) * 8);
             acc = warp_sum(acc);
             if (lane == k) mine = acc;
         }
@@ -607,6 +624,14 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
     return acc;
 }
 
+__device__ __forceinline__ float dot8vh(const uint4 w, const float4 x0, const float4 x1) {
+    const float x[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+    return dot8h(w, x);
+}
+__device__ __forceinline__ float dot8vw(bool h, const uint4 w, const float4 x0, const float4 x1) {
+    return h ? dot8vh(w, x0, x1) : dot8v(w, x0, x1);
+}
+
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
 __device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t) {
     for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
@@ -656,7 +681,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
                 for (int k = 0; k < kFusedGrMaxT; ++k) {
                     if (k < T) {
                         const float4* pk = cur + (size_t) k * (H_TILE / 4);
-                        acc[k] += dot8v(wv[q], pk[j], pk[H_TILE / 8 + j]);
+                        acc[k] += dot8vw(m.a[0].w_f16, wv[q], pk[j], pk[H_TILE / 8 + j]);
                     }
                 }
             }
@@ -812,7 +837,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         const FusedGrArgs& x = a[t];
         if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
-            x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
+            x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm || x.w_f16 != a[0].w_f16) {
             std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
             std::exit(1);
         }

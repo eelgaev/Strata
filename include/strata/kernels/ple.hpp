@@ -54,6 +54,7 @@ struct PleWeights {
     const uint8_t* key_codes = nullptr;    // hc_dim * (n_embd/4) bytes
     const float* key_scales = nullptr;     // hc_dim * (n_embd/64) floats
     const uint16_t* value_bf16 = nullptr;  // n_embd * n_embd
+    bool value_f16 = false;                // STRATA_FP16=load: value_bf16 holds FP16 bits
     const float* norm_key = nullptr;       // hc_dim
     const float* norm_query = nullptr;     // hc_dim
     const float* norm_conv = nullptr;      // hc_dim

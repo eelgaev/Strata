@@ -1,6 +1,7 @@
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
 #include "strata/kernels/fused_gdn.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -92,24 +93,43 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
     h[c] = y;
 }
 
-__global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
-                                                     const uint16_t* __restrict__ wb, const float* __restrict__ dt,
+// 8 weights of a row (16-byte chunk j of a 16-bit row; 32 bytes of an F32 one), widened to FP32 (STRATA_FP16=load)
+template <int WF>
+__device__ __forceinline__ void ab_wload8(const void* base, int j, float* w) {
+    if constexpr (WF == 2) {
+        const float4* p = reinterpret_cast<const float4*>(base) + 2 * j;
+        const float4 a = __ldg(p), b = __ldg(p + 1);
+        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w; w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+    } else {
+        const uint4 v = __ldg(reinterpret_cast<const uint4*>(base) + j);
+        const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            if constexpr (WF == 0) { w[2 * k] = __uint_as_float(u[k] << 16); w[2 * k + 1] = __uint_as_float(u[k] & 0xffff0000u); }
+            else { w[2 * k] = __half2float(__ushort_as_half((uint16_t) u[k])); w[2 * k + 1] = __half2float(__ushort_as_half((uint16_t) (u[k] >> 16))); }
+        }
+    }
+}
+template <int WF>
+__global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x, const void* __restrict__ wa,
+                                                     const void* __restrict__ wb, const float* __restrict__ dt,
                                                      const float* __restrict__ ssm_a, float* __restrict__ gate,
                                                      float* __restrict__ beta, int n, int h_v) {
     const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= 2 * h_v) return;
     const bool is_beta = row >= h_v;
     const int r = is_beta ? row - h_v : row;
-    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
+    const void* wrow = reinterpret_cast<const char*>(is_beta ? wb : wa) + (size_t) r * n * (WF == 2 ? 4 : 2);
     float acc = 0.0f;
     for (int j = lane; j < n / 8; j += 32) {
-        const uint4 wv = __ldg(w4 + j);
+        float w[8];
+        ab_wload8<WF>(wrow, j, w);
         const float4 xa = *reinterpret_cast<const float4*>(x + j * 8);
         const float4 xb = *reinterpret_cast<const float4*>(x + j * 8 + 4);
-        acc = fmaf(__uint_as_float(wv.x << 16), xa.x, acc); acc = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, acc);
-        acc = fmaf(__uint_as_float(wv.y << 16), xa.z, acc); acc = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, acc);
-        acc = fmaf(__uint_as_float(wv.z << 16), xb.x, acc); acc = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, acc);
-        acc = fmaf(__uint_as_float(wv.w << 16), xb.z, acc); acc = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, acc);
+        acc = fmaf(w[0], xa.x, acc); acc = fmaf(w[1], xa.y, acc);
+        acc = fmaf(w[2], xa.z, acc); acc = fmaf(w[3], xa.w, acc);
+        acc = fmaf(w[4], xb.x, acc); acc = fmaf(w[5], xb.y, acc);
+        acc = fmaf(w[6], xb.z, acc); acc = fmaf(w[7], xb.w, acc);
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (lane != 0) return;
@@ -135,14 +155,19 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
     if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
-                  float* gate, float* beta, int n_embd, int h_v, void* stream) {
+void fused_gdn_ab(const float* x, const void* w_alpha, const void* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, void* stream, WForm form) {
     if (!x || !w_alpha || !w_beta || !dt || !ssm_a || !gate || !beta || n_embd % 8 != 0 || h_v <= 0) {
         std::fprintf(stderr, "fused_gdn_ab: invalid arguments\n");
         std::exit(1);
     }
-    gdn_ab_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate,
-                                                                                     beta, n_embd, h_v);
+    const unsigned blocks = (unsigned) ((2 * h_v + 7) / 8);
+    if (form == WForm::Bf16)
+        gdn_ab_kernel<0><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v);
+    else if (form == WForm::F16)
+        gdn_ab_kernel<1><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v);
+    else
+        gdn_ab_kernel<2><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }

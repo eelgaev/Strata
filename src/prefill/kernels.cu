@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
+#include "strata/core/fp16_mode.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/router_top10.hpp"
 
@@ -212,6 +213,25 @@ __global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__
     if (i >= T * D) return;
     const int64_t t = i / D, c = (i % D) / N, d = i % N;
     R[i] = fmaf(bo[t * N + d], 2.0f * sigm(inj[t * inj_ld + c] / (float) HC), R[i]);
+}
+// one block per token: the four inject outputs over the 10240 normalized values, FP32 throughout
+__global__ void __launch_bounds__(256) gr_inject_f32_kernel(const float* __restrict__ R, const float* __restrict__ rs,
+                                                            const float* __restrict__ w, const float* __restrict__ wi,
+                                                            float* __restrict__ inj) {
+    __shared__ float sh[32];
+    const int64_t t = blockIdx.x;
+    float a[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int j = threadIdx.x; j < D; j += 256) {
+        const int c = j / N, d = j % N;
+        const float x = R[t * D + j] * rs[t * HC + c] * w[c * N + d];   // gr_mix_r_kernel's value, bit for bit
+#pragma unroll
+        for (int o = 0; o < HC; ++o) a[o] = fmaf(x, wi[(int64_t) o * D + j], a[o]);
+    }
+#pragma unroll
+    for (int o = 0; o < HC; ++o) {
+        const float s = block_sum(a[o], sh);
+        if (threadIdx.x == 0) inj[t * HC + o] = s;
+    }
 }
 __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restrict__ R, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -689,13 +709,21 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
         host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
     check("kv_append");
 }
+namespace {
+thread_local int g_images_override = -1;
+}
 int prefill_f16_mode() {
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_F16");
-        const int m = e != nullptr ? std::atoi(e) : 0;
-        return m == 1 || m == 2 ? m : 0;
-    }();
-    return v;
+    if (g_images_override >= 0) return g_images_override;
+    const Fp16Mode m = fp16_mode();
+    return m == Fp16Mode::Prefill ? 1 : m == Fp16Mode::Load ? 2 : 0;
+}
+Bf16Images::Bf16Images() : prev_(g_images_override) { g_images_override = 0; }
+Bf16Images::~Bf16Images() { g_images_override = prev_; }
+void gr_inject_f32(const float* R, const float* rs, const float* w_norm, const float* w_inject, float* inj, int64_t T,
+                   void* stream) {
+    if (T <= 0) return;
+    gr_inject_f32_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, w_inject, inj);
+    check("gr_inject_f32");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;

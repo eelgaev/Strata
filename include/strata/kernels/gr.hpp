@@ -19,6 +19,8 @@
 // activation precision must be pinned with the oracle backend and batch geometry, not inferred from weights.
 #pragma once
 
+#include "strata/kernels/bf16_gemv.hpp"
+
 #include <cstdint>
 #include <cstddef>
 
@@ -107,9 +109,11 @@ inline size_t gr_workspace_bytes(const GrShapes& s) { GrWorkspace w; return gr_w
 /// This version splits the work the way the shapes want: `hc` blocks for the per-stream norm, one warp per
 /// row for each of the two projections, and one block-tile for the mean.  The transposes are gone because the
 /// warp-per-row mapping makes them unnecessary.
-void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
-             const uint16_t* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed,
-             float* inject, void* stream);
+/// `f_down_up` / `f_inject`: the weights' stored forms (STRATA_FP16=load: FP16, an F32 inject); not BF16 needs
+/// the native MMVF read.
+void gr_read(const float* R, const float* w_norm, const void* w_down, const void* w_up,
+             const void* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed,
+             float* inject, void* stream, WForm f_down_up = WForm::Bf16, WForm f_inject = WForm::Bf16);
 
 /// `build_hc_combine`.  `R_out[i] = R[i] + block_out[d] * w[c]` with `w[c] = 2*sigmoid(inject[c]/hc)`.
 ///

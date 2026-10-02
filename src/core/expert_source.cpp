@@ -39,6 +39,8 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -457,7 +459,51 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     return true;
 }
 
+#if !defined(_WIN32)
+namespace {
+// The CPUs of NUMA node `node` (its sysfs cpulist), for a thread that must run there; false if none.
+bool node_cpus(int node, cpu_set_t& set) {
+    CPU_ZERO(&set);
+    if (node < 0) return false;
+    char path[96];
+    std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+    std::FILE* f = std::fopen(path, "r");
+    if (f == nullptr) return false;
+    int lo = 0, hi = 0;
+    char sep = 0;
+    while (std::fscanf(f, "%d", &lo) == 1) {
+        hi = lo;
+        if (std::fscanf(f, "%c", &sep) == 1 && sep == '-' && std::fscanf(f, "%d", &hi) == 1) (void) std::fscanf(f, "%c", &sep);
+        for (int c = lo; c <= hi && c < CPU_SETSIZE; ++c) CPU_SET(c, &set);
+    }
+    std::fclose(f);
+    return CPU_COUNT(&set) > 0;
+}
+}  // namespace
+#endif
+
+const uint8_t* FileExpertSource::complement_at(uint64_t offset) const {
+    for (const Segment& s : complement_segs_)
+        if (offset >= s.start && offset < s.end) return (const uint8_t*) s.arena + (size_t) (offset - s.start);
+    return complement_host_ == nullptr ? nullptr : complement_host_ + (size_t) offset;
+}
+
+const uint8_t* FileExpertSource::complement_dev_at(uint64_t offset) const {
+    for (const Segment& s : complement_segs_)
+        if (offset >= s.start && offset < s.end) return s.device + (size_t) (offset - s.start);
+    return complement_device_ == nullptr ? nullptr : complement_device_ + (size_t) offset;
+}
+
+const uint8_t* FileExpertSource::complement_blob(size_t index) const {
+    if (complement_host_ == nullptr || index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement)
+        return nullptr;
+    return complement_at(complement_offsets_[index]);
+}
+
 void FileExpertSource::close() {
+    for (const Segment& s : complement_segs_) (void) cudaFreeHost(s.arena);   // set_arena_placement's, one per node
+    if (!complement_segs_.empty()) complement_arena_ = nullptr;
+    complement_segs_.clear();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
         else {
@@ -956,7 +1002,7 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
     if (complement_ready_) {
         const uint8_t* held =
-            detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+            complement_blob(index);
         if (held == nullptr && !override_.empty()) held = override_[index];
         if (held != nullptr) {
             std::memcpy(dst, held, (size_t) bytes);
@@ -1021,6 +1067,11 @@ bool FileExpertSource::pin_cache_complement(
             if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
         }
     }
+    if (arena_whole_) {   // set_arena_placement: every expert, the caches' too (see there)
+        primary_gpu_pairs.clear();
+        pair_slot.clear();
+        lend_from_slot = -1;
+    }
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
@@ -1057,6 +1108,15 @@ bool FileExpertSource::pin_cache_complement(
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                if (b > budget_bytes - at) continue;
+                ranked[i] = at;
+                at += b;
+                ++held;
+            }
+        if (arena_whole_)   // a layer split's rank is CUDA0's layers only: the others after them, in layer order
+            for (size_t i = 0; i < offsets.size(); ++i) {
+                if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;
+                const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
                 if (b > budget_bytes - at) continue;
                 ranked[i] = at;
                 at += b;
@@ -1109,6 +1169,27 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
 
+    // set_arena_placement: the bytes grouped by the node of each layer's GPU (their order kept within a node), and
+    // where each node's range ends
+    std::vector<std::pair<int, uint64_t>> node_ranges;
+    if ((int64_t) arena_layer_node_.size() == n_layers_ && bytes > 0) {
+        std::vector<size_t> idx;
+        for (size_t i = 0; i < offsets.size(); ++i)
+            if (offsets[i] != kNoComplement) idx.push_back(i);
+        auto node_of = [&](size_t i) { return arena_layer_node_[i / (size_t) n_expert_]; };
+        std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+            return node_of(a) != node_of(b) ? node_of(a) < node_of(b) : offsets[a] < offsets[b];
+        });
+        uint64_t at = 0;
+        for (const size_t i : idx) {
+            if (node_ranges.empty() || node_ranges.back().first != node_of(i)) node_ranges.emplace_back(node_of(i), at);
+            offsets[i] = at;
+            at += layer_blob_bytes_[i / (size_t) n_expert_];
+            node_ranges.back().second = at;
+        }
+    }
+    std::vector<Segment> segs;
+
     void* arena = nullptr;
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
@@ -1118,6 +1199,9 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
     auto release = [&]() {
+        for (const Segment& s : segs) (void) cudaFreeHost(s.arena);
+        if (!segs.empty()) arena = nullptr;
+        segs.clear();
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
@@ -1131,7 +1215,51 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);
-        if (pin) {
+#if !defined(_WIN32)
+        if (pin && !node_ranges.empty()) {
+            // one page-locked, mapped allocation per node, made on that node's CPUs (see set_arena_placement)
+            int dev = 0;
+            cudaGetDevice(&dev);
+            uint64_t start = 0;
+            bool ok = true;
+            for (const auto& [node, end] : node_ranges) {
+                void* p = nullptr;
+                std::thread([&, node = node, end = end] {
+                    cpu_set_t set;
+                    if (node_cpus(node, set)) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+                    cudaSetDevice(dev);
+                    if (cudaHostAlloc(&p, (size_t) (end - start), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        p = nullptr;
+                    }
+                }).join();
+                void* alias = nullptr;
+                if (p == nullptr || cudaHostGetDevicePointer(&alias, p, 0) != cudaSuccess || alias == nullptr) {
+                    (void) cudaGetLastError();
+                    if (p != nullptr) (void) cudaFreeHost(p);
+                    ok = false;
+                    break;
+                }
+                segs.push_back({p, start, end, (const uint8_t*) alias, node});
+                std::fprintf(stderr, "FileExpertSource: %.2f GiB of the arena on NUMA node %d (the GPUs there)\n",
+                             (double) (end - start) / 1073741824.0, node);
+                start = end;
+            }
+            if (ok) {
+                arena = segs.front().arena;
+                device = segs.front().device;
+                pinned_ok = true;
+                char msg[96];
+                std::snprintf(msg, sizeof msg, "page-locked and mapped, one allocation per NUMA node (%zu)", segs.size());
+                note = msg;
+            } else {
+                for (const Segment& s : segs) (void) cudaFreeHost(s.arena);
+                segs.clear();
+                note = "a per-node allocation failed: one arena";
+            }
+        }
+#endif
+        if (pin && arena == nullptr) {
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
@@ -1245,13 +1373,23 @@ bool FileExpertSource::pin_cache_complement(
         for (;;) {
             const int64_t layer = next_layer.fetch_add(1);
             if (layer >= n_layers_ || failed.load()) return;
+#if !defined(_WIN32)
+            // set_arena_placement: written by the CPUs of the node it lives on - on a POWER9 a GPU reads memory the
+            // other socket's CPUs wrote at 45 GB/s, its own socket's at 68, though the pages are on its node either way
+            if (!segs.empty() && (size_t) layer < arena_layer_node_.size()) {
+                cpu_set_t set;
+                if (node_cpus(arena_layer_node_[(size_t) layer], set)) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+            }
+#endif
             const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
             for (int64_t expert = 0; expert < n_expert_; ++expert) {
                 const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
                 const uint64_t offset = offsets[index];
                 if (offset == kNoComplement) continue;
-                if (offset > bytes || blob_bytes > bytes - offset ||
-                    !copy_from_files(layer, expert, (uint8_t*) host + (size_t) offset)) {
+                uint8_t* to = (uint8_t*) host + (size_t) offset;
+                for (const Segment& s : segs)
+                    if (offset >= s.start && offset < s.end) to = (uint8_t*) s.arena + (size_t) (offset - s.start);
+                if (offset > bytes || blob_bytes > bytes - offset || !copy_from_files(layer, expert, to)) {
                     fail("FileExpertSource: invalid blob bounds while building the cache complement");
                     return;
                 }
@@ -1287,8 +1425,9 @@ bool FileExpertSource::pin_cache_complement(
     {
         const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
         std::vector<std::thread> pool;
-        for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
-        worker();
+        // with per-node segments the workers move between nodes (above): the calling thread keeps its own pin
+        for (int i = segs.empty() ? 1 : 0; i < threads; ++i) pool.emplace_back(worker);
+        if (segs.empty()) worker();
         for (auto& t : pool) t.join();
     }
     std::fflush(stderr);
@@ -1305,6 +1444,7 @@ bool FileExpertSource::pin_cache_complement(
 #endif
 
     complement_arena_ = arena;
+    complement_segs_ = std::move(segs);
     complement_host_ = host;
     complement_device_ = device;
     complement_bytes_ = bytes;
@@ -1393,7 +1533,7 @@ int64_t FileExpertSource::commit_exchanges() {
         const uint64_t at = complement_offsets_[x.in];
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr) {
-            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+            std::memcpy((uint8_t*) complement_at(at), src, (size_t) x.bytes);
             if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
         }
         override_[x.out] = nullptr;
@@ -1409,7 +1549,7 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     const uint8_t* result = nullptr;
     bool from_files = true;
     if (complement_ready_) {
-        result = detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+        result = complement_blob(index);
         if (result != nullptr) {
             ram_reads_.fetch_add(1, std::memory_order_relaxed);
             from_files = false;
@@ -1445,7 +1585,7 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    return complement_device_ + (size_t) complement_offsets_[index];
+    return complement_dev_at(complement_offsets_[index]);
 }
 
 bool FileExpertSource::pcie_layer(int64_t layer) const {

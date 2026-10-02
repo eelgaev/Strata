@@ -427,6 +427,24 @@ public:
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
     void close();
+    /// A layer split across sockets (an IBM AC922: GPUs 0-1 on NUMA node 0, 2-3 on node 8): call before
+    /// `pin_cache_complement`.  `layer_node[l]` is the NUMA node of the GPU that runs layer l (-1: unknown).  The
+    /// arena is laid out node by node, one cudaHostAlloc per node made by a thread on that node's CPUs: the driver
+    /// puts page-locked memory on the allocating thread's node (not where a memory policy asks), and a GPU reads its
+    /// own socket's memory at 68 GB/s on the AC922, the other socket's at 40 - by DMA and in place alike, whichever
+    /// thread issues the copy.  `whole_model`: every expert is copied, the GPU caches' too, so an expert a swap
+    /// evicts from any stage's cache is in RAM already (no exchange: those read only CUDA0's cache).
+    void set_arena_placement(std::vector<int> layer_node, bool whole_model) {
+        arena_layer_node_ = std::move(layer_node);
+        arena_whole_ = whole_model;
+    }
+    /// set_arena_placement's allocation on NUMA node `node` (its host address and size), for the stages to probe the
+    /// link against the memory they read; false when there is none.
+    bool arena_segment(int node, const uint8_t*& host, uint64_t& bytes) const {
+        for (const Segment& s : complement_segs_)
+            if (s.node == node) { host = (const uint8_t*) s.arena; bytes = s.end - s.start; return true; }
+        return false;
+    }
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
@@ -549,6 +567,14 @@ private:
     std::vector<uint64_t> complement_offsets_;
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
+    /// set_arena_placement: the arena's offsets [start, end) in one cudaHostAlloc per NUMA node (empty: one arena)
+    struct Segment { void* arena; uint64_t start, end; const uint8_t* device; int node; };
+    std::vector<Segment> complement_segs_;
+    std::vector<int> arena_layer_node_;
+    bool arena_whole_ = false;
+    const uint8_t* complement_at(uint64_t offset) const;       ///< the host address of an arena offset
+    const uint8_t* complement_dev_at(uint64_t offset) const;   ///< its device address (mapped)
+    const uint8_t* complement_blob(size_t index) const;        ///< an expert's bytes in the arena, or null
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;

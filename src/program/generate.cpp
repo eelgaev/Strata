@@ -129,7 +129,7 @@ using Clock = std::chrono::steady_clock;
 template <class Swap>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
                           const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, int64_t cache_layers) {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -137,6 +137,9 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
     kept.reserve(swaps.size());
     for (const Swap& s : swaps) {
         if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
+        // a later stage's layer (a layer split): `cache` is CUDA0's, so no copy back from it - such a swap waits
+        // (with set_arena_placement's whole model every expert is in RAM, and none needs one)
+        if (s.layer >= cache_layers) continue;
         const int64_t q = (int64_t) staged.size();
         if (q >= src.exchange_capacity()) continue;
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
@@ -947,32 +950,62 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
 // The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
 // reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
 // carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).
+// The NUMA node of CUDA device `dev` (its PCI device's numa_node in sysfs), or -1.
+int gpu_numa_node(int dev) {
+#if defined(_WIN32)
+    (void) dev;
+    return -1;
+#else
+    char bus[64] = {};
+    unsigned dom = 0, b = 0, d = 0, f = 0;
+    if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev) != cudaSuccess) { cudaGetLastError(); return -1; }
+    if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &f) != 4) return -1;
+    char path[128];
+    std::snprintf(path, sizeof path, "/sys/bus/pci/devices/%04x:%02x:%02x.%x/numa_node", dom, b, d, f);
+    int node = -1;
+    if (std::FILE* fp = std::fopen(path, "r")) {
+        if (std::fscanf(fp, "%d", &node) != 1) node = -1;
+        std::fclose(fp);
+    }
+    return node;
+#endif
+}
+
+double probe_h2d_from(const void* h, size_t bytes);
+
 double probe_pcie_h2d_gbps() {
     constexpr size_t kBytes = 256ull << 20;
-    constexpr int kIters = 4;
     void* h = nullptr;
+    if (cudaMallocHost(&h, kBytes) != cudaSuccess) return -1.0;
+    std::memset(h, 0, kBytes);   // fault the pages in before timing
+    const double bw = probe_h2d_from(h, kBytes);
+    cudaFreeHost(h);
+    return bw;
+}
+
+// The timed copies of probe_pcie_h2d_gbps from `h` (page-locked, at least `bytes`) to the current device: a layer
+// split's stage probes the arena segment on its own socket with it (set_arena_placement).
+double probe_h2d_from(const void* h, size_t bytes) {
+    constexpr int kIters = 4;
     void* d = nullptr;
     cudaEvent_t ev0, ev1;
-    if (cudaMallocHost(&h, kBytes) != cudaSuccess) return -1.0;
-    if (cudaMalloc(&d, kBytes) != cudaSuccess || cudaEventCreate(&ev0) != cudaSuccess ||
+    if (cudaMalloc(&d, bytes) != cudaSuccess || cudaEventCreate(&ev0) != cudaSuccess ||
         cudaEventCreate(&ev1) != cudaSuccess) {
         if (d != nullptr) cudaFree(d);
-        cudaFreeHost(h);
+        cudaGetLastError();
         return -1.0;
     }
-    std::memset(h, 0, kBytes);   // fault the pages in before timing
-    cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);   // warmup: context up, copy engine primed
+    cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice);   // warmup: context up, copy engine primed
     cudaEventRecord(ev0);
-    for (int i = 0; i < kIters; ++i) cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
+    for (int i = 0; i < kIters; ++i) cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice);
     cudaEventRecord(ev1);
     const bool ok = cudaEventSynchronize(ev1) == cudaSuccess;
     float ms = 0.f;
     const bool timed = ok && cudaEventElapsedTime(&ms, ev0, ev1) == cudaSuccess && ms > 0.01f;
-    const double bw = timed ? ((double) kIters * (double) kBytes / (ms * 1e-3)) / 1e9 : -1.0;
+    const double bw = timed ? ((double) kIters * (double) bytes / (ms * 1e-3)) / 1e9 : -1.0;
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
     cudaFree(d);
-    cudaFreeHost(h);
     return bw;
 }
 
@@ -1345,8 +1378,10 @@ int main(int argc, char** argv) {
         o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
         o.resident_headroom = 8ull << 30;
     }
-    if (o.resident_cpu_experts && (!o.layer_split.empty() || remote_caches)) {
-        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
+    // a RAM budget with a layer split: the whole model in one arena placed by socket (set_arena_placement, below)
+    if (o.resident_cpu_experts && (remote_caches || (!o.layer_split.empty() && o.resident_budget == 0))) {
+        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits (except with "
+                             "--resident-budget-gib) or remote expert caches\n");
         return 2;
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
@@ -3797,12 +3832,37 @@ int main(int argc, char** argv) {
             const int64_t k = plan_lend(chunk);
             if (k > 0) lend_from = xcache.slots() - k;
         }
+        if (!stages.empty()) {
+            // a layer split: the whole model, each stage's layers on its GPU's socket; no lend region (a lent slot's
+            // expert is in RAM anyway)
+            int dev0 = 0;
+            cudaGetDevice(&dev0);
+            std::vector<int> layer_node((size_t) g.n_layers, gpu_numa_node(dev0));
+            for (const auto& st : stages)
+                for (int64_t l = st->lb; l < st->le && l < g.n_layers; ++l) layer_node[(size_t) l] = gpu_numa_node(st->dev);
+            src.set_arena_placement(std::move(layer_node), true);
+            lend_from = -1;
+        }
         if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
                                      o.resident_budget, &profile)) {
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
+            }
+            // a layer split: each stage's share of the misses from its link to the arena segment on its own socket
+            // (the probe above copies from wherever the driver put its buffer)
+            for (auto& st : stages) {
+                const uint8_t* seg = nullptr;
+                uint64_t seg_bytes = 0;
+                if (pcie_given || !src.arena_segment(gpu_numa_node(st->dev), seg, seg_bytes) || seg_bytes < (64ull << 20))
+                    continue;
+                const strata::core::OnDevice on(st->dev);
+                const double bw = probe_h2d_from(seg, 64ull << 20);
+                if (bw <= 0.0) continue;
+                st->pcie_frac = pcie_share(0.55, bw);
+                std::fprintf(stderr, "strata generate: layer split: CUDA%d from its socket's arena: %.1f GB/s -> pcie_frac "
+                                     "%.2f\n", st->dev, bw, st->pcie_frac);
             }
             std::fprintf(stderr, "strata generate: resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
                                  "cache; adaptive swaps %s\n",
@@ -4499,7 +4559,8 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
+            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream,
+                                      stages.empty() ? g.n_layers : stages.front()->lb)) return false;
             bool main_live = false;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
@@ -6091,7 +6152,8 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) {
+            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream,
+                                      stages.empty() ? g.n_layers : stages.front()->lb)) {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed (copying evicted experts back)\n");
                 return false;
             }

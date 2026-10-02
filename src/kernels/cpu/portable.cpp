@@ -18,6 +18,8 @@
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
+#elif defined(__VSX__)
+#include <altivec.h>   // the types spelled __vector: a strict -std=c++20 has no `vector` keyword
 #endif
 
 namespace strata::kernels::cpu {
@@ -133,6 +135,39 @@ void bf16_rows_dot(const uint16_t* w, int rows, int cols, const float* x, float*
 }
 
 void bf16_rows_dot_multi(const uint16_t* w, int rows, int cols, const float* x, int nt, float* out) {
+#if defined(__VSX__) && !defined(__ARM_NEON)
+    // POWER (VSX): as kq_avx2.cpp's AVX2 version, each row read once for all `nt` (<= 8) tokens, here as two 4-wide
+    // FMA accumulators per token.  A BF16 is the high half of an F32: merging zeros below each u16 (little-endian)
+    // makes the F32 lanes.  Its only caller is the router lookahead (a page prefetch hint), so the summation order
+    // differing from the scalar loop's changes no answer.
+    if (nt >= 1 && nt <= 8) {
+        const __vector unsigned short z = vec_splats((unsigned short) 0);
+        const int c8 = cols & ~7;
+        for (int r = 0; r < rows; ++r) {
+            const uint16_t* wr = w + (size_t) r * (size_t) cols;
+            __vector float a0[8], a1[8];
+            for (int t = 0; t < nt; ++t) a0[t] = a1[t] = vec_splats(0.0f);
+            for (int c = 0; c < c8; c += 8) {
+                const __vector unsigned short h = vec_xl(0, wr + c);
+                const __vector float w0 = (__vector float) vec_mergeh(z, h);   // lanes c .. c+3
+                const __vector float w1 = (__vector float) vec_mergel(z, h);   // lanes c+4 .. c+7
+                for (int t = 0; t < nt; ++t) {
+                    const float* xt = x + (size_t) t * cols + c;
+                    a0[t] = vec_madd(w0, vec_xl(0, xt), a0[t]);
+                    a1[t] = vec_madd(w1, vec_xl(16, xt), a1[t]);
+                }
+            }
+            for (int t = 0; t < nt; ++t) {
+                const __vector float a = vec_add(a0[t], a1[t]);
+                float s = (a[0] + a[1]) + (a[2] + a[3]);
+                const float* xt = x + (size_t) t * cols;
+                for (int c = c8; c < cols; ++c) s += bf16f(wr[c]) * xt[c];
+                out[(size_t) t * rows + r] = s;
+            }
+        }
+        return;
+    }
+#endif
     for (int r = 0; r < rows; ++r) {
         const uint16_t* wr = w + (size_t) r * (size_t) cols;
         for (int t = 0; t < nt; ++t) {

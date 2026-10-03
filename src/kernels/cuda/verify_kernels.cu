@@ -133,6 +133,55 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
     }
 }
 
+// gdn_ab_multi_kernel for TT tokens and n = 2560 (10 chunks per lane): the loops have fixed trip counts, so every
+// chunk's weight and activation loads can be issued up front; the same FMAs in the same order
+template <int WF, int TT>
+__global__ void __launch_bounds__(256) gdn_ab_multi_t_kernel(const float* __restrict__ x, const void* __restrict__ wa,
+                                                             const void* __restrict__ wb, const float* __restrict__ dt,
+                                                             const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                                             float* __restrict__ beta, int h_v) {
+    constexpr int n = 2560, CH = n / 8 / 32;
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= 2 * h_v) return;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const void* wrow = reinterpret_cast<const char*>(is_beta ? wb : wa) + (size_t) r * n * (WF == 2 ? 4 : 2);
+    float acc[TT];
+#pragma unroll
+    for (int t = 0; t < TT; ++t) acc[t] = 0.0f;
+#pragma unroll
+    for (int it = 0; it < CH; ++it) {
+        const int j = lane + 32 * it;
+        float w[8];
+        wload8<WF>(wrow, j, w);
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const float* xt = x + (size_t) t * n;
+            const float4 xa = *reinterpret_cast<const float4*>(xt + j * 8);
+            const float4 xb = *reinterpret_cast<const float4*>(xt + j * 8 + 4);
+            float a = acc[t];
+            a = fmaf(w[0], xa.x, a); a = fmaf(w[1], xa.y, a);
+            a = fmaf(w[2], xa.z, a); a = fmaf(w[3], xa.w, a);
+            a = fmaf(w[4], xb.x, a); a = fmaf(w[5], xb.y, a);
+            a = fmaf(w[6], xb.z, a); a = fmaf(w[7], xb.w, a);
+            acc[t] = a;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        float a = acc[t];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane != 0) continue;
+        if (is_beta) {
+            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+        } else {
+            const float v = a + dt[r];
+            const float sp = v > 20.0f ? v : log1pf(__expf(v));
+            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+        }
+    }
+}
+
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
@@ -545,6 +594,17 @@ void gdn_ab_multi(const float* x, const void* w_alpha, const void* w_beta, const
         std::exit(1);
     }
     const unsigned blocks = (unsigned) ((2 * h_v + 7) / 8);
+    static const bool generic = [] { const char* v = std::getenv("STRATA_HC_DOWN_GENERIC"); return v && v[0] == '1'; }();
+    if (n_embd == 2560 && !generic) {
+        const cudaStream_t st = (cudaStream_t) stream;
+#define STRATA_AB_T(TT) case TT: \
+        if (form == WForm::Bf16) gdn_ab_multi_t_kernel<0, TT><<<blocks, 256, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v); \
+        else if (form == WForm::F16) gdn_ab_multi_t_kernel<1, TT><<<blocks, 256, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v); \
+        else gdn_ab_multi_t_kernel<2, TT><<<blocks, 256, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v); \
+        check("gdn_ab_multi"); return;
+        switch (n_tok) { STRATA_AB_T(1) STRATA_AB_T(2) STRATA_AB_T(3) STRATA_AB_T(4) STRATA_AB_T(5) STRATA_AB_T(6) STRATA_AB_T(7) STRATA_AB_T(8) default: break; }
+#undef STRATA_AB_T
+    }
     if (form == WForm::Bf16)
         gdn_ab_multi_kernel<0><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     else if (form == WForm::F16)

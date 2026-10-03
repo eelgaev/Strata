@@ -6,6 +6,7 @@
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
+#include <cstdint>
 
 #include <cmath>
 #include <cstdio>
@@ -276,7 +277,14 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    // 16-byte stores when both sides allow (a quarter of the writes across the link to mapped memory)
+    if ((n & 3) == 0 && (((uintptr_t) x | (uintptr_t) x_out) & 15u) == 0) {
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        float4* o4 = reinterpret_cast<float4*>(x_out);
+        for (int i = threadIdx.x; i < n / 4; i += blockDim.x) o4[i] = x4[i];
+    } else {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    }
     if ((int) threadIdx.x < k) { ids_out[threadIdx.x] = ids[threadIdx.x]; w_out[threadIdx.x] = w[threadIdx.x]; }
     __threadfence_system();
     __syncthreads();

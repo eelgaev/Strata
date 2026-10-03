@@ -297,14 +297,17 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             const long long j = i + u * S, k = j / per;
-            v[u] = ((const uint4*) src[k])[j - k * per];
+            if (src[k] != 0ull) v[u] = ((const uint4*) src[k])[j - k * per];   // 0: prefetched (STRATA_PREFETCH)
         }
 #pragma unroll
-        for (int u = 0; u < 4; ++u) dst[i + u * S] = v[u];
+        for (int u = 0; u < 4; ++u) {
+            const long long j = i + u * S, k = j / per;
+            if (src[k] != 0ull) dst[j] = v[u];
+        }
     }
     for (; i < total; i += S) {
         const long long k = i / per;
-        dst[i] = ((const uint4*) src[k])[i - k * per];
+        if (src[k] != 0ull) dst[i] = ((const uint4*) src[k])[i - k * per];
     }
 }
 
@@ -316,6 +319,7 @@ __global__ void fetch_blobs_strided_kernel(const unsigned long long* __restrict_
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += S) {
         const long long j = i / per, off = i - j * per;
         const int q = q0 + (int) j * qstep;
+        if (src[q] == 0ull) continue;   // prefetched (STRATA_PREFETCH)
         ((uint4*) (dst + (size_t) q * (size_t) per * 16))[off] = ((const uint4*) src[q])[off];
     }
 }
@@ -676,6 +680,99 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     __threadfence();
     *skip = ring;
 }
+// STRATA_LOOKAHEAD_STATS: layer l's actual routing `a` against the prediction `p` (layer l's router on layer l-1's MoE
+// input); c[0] entries, c[1] entries whose expert was predicted for the same token, c[2] distinct missed experts
+// (not resident), c[3] of those predicted for any token of the window, c[4] distinct predicted experts not resident
+__global__ void lookahead_stats_kernel(const int32_t* a, const int32_t* p, int n, const int32_t* res,
+                                       unsigned long long* c) {
+    unsigned long long e = 0, ehit = 0, miss = 0, mhit = 0, pmiss = 0;
+    for (int i = 0; i < n; ++i) {
+        const int t = i / 10;
+        bool hit = false;
+        for (int j = 0; j < 10; ++j) hit |= p[t * 10 + j] == a[i];
+        ++e; ehit += hit;
+        bool first = true;
+        for (int j = 0; j < i; ++j) first &= a[j] != a[i];
+        if (first && res[a[i]] < 0) {
+            ++miss;
+            bool any = false;
+            for (int j = 0; j < n; ++j) any |= p[j] == a[i];
+            mhit += any;
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        bool first = true;
+        for (int j = 0; j < i; ++j) first &= p[j] != p[i];
+        if (first && res[p[i]] < 0) ++pmiss;
+    }
+    c[0] += e; c[1] += ehit; c[2] += miss; c[3] += mhit; c[4] += pmiss;
+    __threadfence_system();
+}
+// STRATA_PREFETCH: the next layer's predicted experts (top-10 per token) that are not resident, distinct, in order,
+// at most `cap`: their arena blobs copied into `buf` (slot stride `stride16` x 16 B) and `slot_src` = their arena
+// address (0: an empty slot).  Every block builds the list itself (<= 80 entries), then the blocks copy.
+__global__ void prefetch_blobs_kernel(const int32_t* __restrict__ pred, int n, const int32_t* __restrict__ res,
+                                      const unsigned long long* __restrict__ alias, unsigned long long* slot_src,
+                                      uint4* __restrict__ buf, long long per16, long long stride16, int cap) {
+    __shared__ unsigned long long src[32];
+    __shared__ int cnt;
+    if (threadIdx.x == 0) {
+        int c = 0;
+        for (int i = 0; i < n && c < cap; ++i) {
+            const int32_t e = pred[i];
+            bool first = true;
+            for (int j = 0; j < i; ++j) first &= pred[j] != e;
+            if (!first || res[e] >= 0 || alias[e] == 0ull) continue;
+            src[c++] = alias[e];
+        }
+        cnt = c;
+        if (blockIdx.x == 0)
+            for (int k = 0; k < cap; ++k) slot_src[k] = k < c ? src[k] : 0ull;
+    }
+    __syncthreads();
+    const long long total = (long long) cnt * per16, S = (long long) gridDim.x * blockDim.x;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += S) {
+        const long long k = i / per16, off = i - k * per16;
+        buf[k * stride16 + off] = ((const uint4*) src[k])[off];
+    }
+}
+// STRATA_PREFETCH: per PCIe group q, its blob's prefetch slot (matched by arena address): srcq[q] = 0 and hit[q] = the
+// slot's address when prefetched, else srcq[q] = ptr2[q] and hit[q] = 0
+__global__ void prefetch_resolve_kernel(const unsigned long long* ptr2, const int32_t* n, const unsigned long long* slot_src,
+                                        int cap, const uint8_t* buf, long long stride, unsigned long long* srcq,
+                                        unsigned long long* hit) {
+    const int q = threadIdx.x;
+    if (q >= *n) return;
+    const unsigned long long p = ptr2[q];
+    unsigned long long h = 0ull;
+    for (int k = 0; k < cap; ++k)
+        if (slot_src[k] == p && p != 0ull) { h = (unsigned long long) (buf + (size_t) k * (size_t) stride); break; }
+    hit[q] = h;
+    srcq[q] = h ? 0ull : p;
+}
+// STRATA_PREFETCH_CHECK: every prefetched PCIe group's blob (now at ptr2[q]) against its arena original (orig[q]);
+// c[0] += groups checked, c[1] += groups whose bytes differ
+__global__ void prefetch_check_kernel(const unsigned long long* ptr2, const unsigned long long* hit,
+                                      const unsigned long long* orig, const int32_t* n, long long per16,
+                                      unsigned long long* c) {
+    const int q = blockIdx.x;
+    if (q >= *n || hit[q] == 0ull) return;
+    __shared__ int bad;
+    if (threadIdx.x == 0) bad = 0;
+    __syncthreads();
+    const uint4* a = (const uint4*) ptr2[q];
+    const uint4* b = (const uint4*) orig[q];
+    for (long long i = threadIdx.x; i < per16; i += blockDim.x) {
+        const uint4 x = a[i], y = b[i];
+        if (x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w) bad = 1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) { atomicAdd(c, 1ull); if (bad) atomicAdd(c + 1, 1ull); __threadfence_system(); }
+}
+__global__ void prefetch_rebase_kernel(unsigned long long* ptr2, const int32_t* n, const unsigned long long* hit) {
+    const int q = threadIdx.x;
+    if (q < *n && hit[q] != 0ull) ptr2[q] = hit[q];
+}
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
     while (*flag < value) strata_spin_pause();
@@ -700,6 +797,33 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
                                                              blob, plan, capx, skip, ring);
     check("resident_plan");
+}
+void lookahead_stats(const int32_t* actual, const int32_t* predicted, int n, const int32_t* res_layer,
+                     unsigned long long* counters, void* stream) {
+    lookahead_stats_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(actual, predicted, n, res_layer, counters);
+    check("lookahead_stats");
+}
+void prefetch_blobs(const int32_t* pred, int n, const int32_t* res_layer, const unsigned long long* alias_layer,
+                    unsigned long long* slot_src, uint8_t* buf, int64_t blob_bytes, int64_t slot_bytes, int cap,
+                    void* stream) {
+    prefetch_blobs_kernel<<<24, 256, 0, (cudaStream_t) stream>>>(pred, n, res_layer, alias_layer, slot_src, (uint4*) buf,
+                                                                 (long long) (blob_bytes / 16), (long long) (slot_bytes / 16), cap);
+    check("prefetch_blobs");
+}
+void prefetch_resolve(const unsigned long long* ptr2, const int32_t* n, const unsigned long long* slot_src, int cap,
+                      const uint8_t* buf, int64_t slot_bytes, unsigned long long* srcq, unsigned long long* hit,
+                      void* stream) {
+    prefetch_resolve_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ptr2, n, slot_src, cap, buf, (long long) slot_bytes, srcq, hit);
+    check("prefetch_resolve");
+}
+void prefetch_check(const unsigned long long* ptr2, const unsigned long long* hit, const unsigned long long* orig,
+                    const int32_t* n, int64_t blob_bytes, int cap, unsigned long long* counters, void* stream) {
+    prefetch_check_kernel<<<(unsigned) cap, 256, 0, (cudaStream_t) stream>>>(ptr2, hit, orig, n, (long long) (blob_bytes / 16), counters);
+    check("prefetch_check");
+}
+void prefetch_rebase(unsigned long long* ptr2, const int32_t* n, const unsigned long long* hit, void* stream) {
+    prefetch_rebase_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ptr2, n, hit);
+    check("prefetch_rebase");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);

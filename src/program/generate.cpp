@@ -1589,6 +1589,10 @@ int main(int argc, char** argv) {
         // Plan v0.3 (24 Sep): the CPU experts stay on the VNNI kernel.  The llama.cpp-CPU-exact q8_0 contract
         // cost 27.0 vs 17.2 ms/token of pool time and G-C does not need it; `--cpu-oracle-q8-0` still selects it.
     }
+    // STRATA_PREFETCH (1: on; "reserve": the same VRAM held back, prefetch off - the A/B arm with an equal cache): the
+    // verifier's prefetch slots are allocated after the expert cache, so the cache leaves room for them
+    if (const char* pv = std::getenv("STRATA_PREFETCH"); pv != nullptr && (pv[0] == '1' || std::strcmp(pv, "reserve") == 0))
+        o.vram_reserve_mib += 176;
     if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
         std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
         return 2;
@@ -4353,6 +4357,14 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        // STRATA_PREFETCH=1: each verifier prefetches the next layer's predicted non-resident experts (bit-identical)
+        if (const char* pv = std::getenv("STRATA_PREFETCH"); pv != nullptr && pv[0] == '1' && srcp != nullptr) {
+            for (int st = 0; st < std::max(n_stages, 1); ++st) {
+                std::string why;
+                const bool on = n_stages > 1 ? stage_ver(st).set_prefetch(*srcp, why) : ver.set_prefetch(*srcp, why);
+                std::fprintf(stderr, "strata serve: STRATA_PREFETCH: stage %d %s (%s)\n", st, on ? "on" : "off", why.c_str());
+            }
+        }
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the

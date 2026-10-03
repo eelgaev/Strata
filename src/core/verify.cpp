@@ -135,6 +135,58 @@ const int64_t g_test_stall = [] {
 }();
 }  // namespace
 
+bool Verifier::set_prefetch(const ExpertSource& src, std::string& why) {
+    const OnDevice on_device(device_);
+    if (sink_.pcie_mode != 2) { why = "the PCIe mode is not the copy kernel"; return false; }
+    if (hits_.d_res == nullptr) { why = "no device residency table"; return false; }
+    if (la_logits_ == nullptr) {
+        const size_t mt = (size_t) max_t_ * 4;
+        if (cudaMalloc((void**) &la_logits_, mt * (size_t) g_->n_expert * 4) != cudaSuccess ||
+            cudaMalloc((void**) &la_w_, mt * 10 * 4) != cudaSuccess || cudaMalloc((void**) &la_ids_, mt * 10 * 4) != cudaSuccess) {
+            cudaGetLastError(); why = "prediction buffers"; return false;
+        }
+    }
+    const int64_t NE = g_->n_expert;
+    std::vector<unsigned long long> a((size_t) (g_->n_layers * NE), 0ull);
+    for (int64_t l = lb_; l < le_; ++l)
+        for (int64_t e = 0; e < NE; ++e) {
+            const uint8_t* p = src.pinned(l, e) ? src.device_alias(l, e) : nullptr;
+            a[(size_t) (l * NE + e)] = (unsigned long long) p;
+        }
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    pf_slot_ = (int64_t) ((lay.max_blob + 255) & ~(size_t) 255);
+    const int64_t capx = (int64_t) max_t_ * 10;
+    const size_t buf = (size_t) 4 * kPfSlots * (size_t) pf_slot_;
+    const bool ok = cudaMalloc((void**) &alias_d_, a.size() * 8) == cudaSuccess &&
+                    cudaMemcpy(alias_d_, a.data(), a.size() * 8, cudaMemcpyHostToDevice) == cudaSuccess &&
+                    cudaMalloc((void**) &pf_buf_, buf) == cudaSuccess &&
+                    cudaMalloc((void**) &pf_src_, (size_t) 4 * kPfSlots * 8) == cudaSuccess &&
+                    cudaMemset(pf_src_, 0, (size_t) 4 * kPfSlots * 8) == cudaSuccess &&
+                    cudaMalloc((void**) &pf_srcq_, (size_t) 2 * capx * 8) == cudaSuccess &&
+                    cudaMalloc((void**) &pf_hit_, (size_t) 2 * capx * 8) == cudaSuccess &&
+                    cudaStreamCreateWithFlags(&pf_s_, cudaStreamNonBlocking) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&ev_pred_, cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&ev_pf_[0][0], cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&ev_pf_[0][1], cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&ev_pf_[1][0], cudaEventDisableTiming) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&ev_pf_[1][1], cudaEventDisableTiming) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        why = "VRAM for the prefetch buffers (" + std::to_string((unsigned long long) (buf >> 20)) + " MiB)";
+        return false;
+    }
+    if (const char* c = std::getenv("STRATA_PREFETCH_CHECK"); c != nullptr && c[0] == '1') {
+        pf_check_ = cudaMalloc((void**) &pf_orig_, (size_t) 2 * capx * 8) == cudaSuccess &&
+                    cudaHostAlloc((void**) &h_pfc_, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+                    cudaHostGetDevicePointer((void**) &m_pfc_, h_pfc_, 0) == cudaSuccess;
+        if (pf_check_) std::memset(h_pfc_, 0, 64);
+        else cudaGetLastError();
+    }
+    pf_on_ = true;
+    why = std::to_string((unsigned long long) (buf >> 20)) + " MiB of prefetch slots";
+    return true;
+}
+
 bool Verifier::set_partner(int dev, std::string& err) {
     (void) err;
     if (const char* v = std::getenv("STRATA_FETCH_PARTNER"); v != nullptr && std::atoi(v) == 0) return true;
@@ -429,6 +481,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
         if (!ok2) { cudaGetLastError(); device_plan_ = false; }
+    }
+    if (const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); v != nullptr && v[0] == '1') {
+        const size_t mt = (size_t) max_t * 4;
+        la_stats_ = cudaMalloc((void**) &la_logits_, mt * (size_t) g.n_expert * 4) == cudaSuccess &&
+                    cudaMalloc((void**) &la_w_, mt * 10 * 4) == cudaSuccess &&
+                    cudaMalloc((void**) &la_ids_, mt * 10 * 4) == cudaSuccess &&
+                    cudaHostAlloc((void**) &h_la_, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+                    cudaHostGetDevicePointer((void**) &m_la_, h_la_, 0) == cudaSuccess;
+        if (la_stats_) std::memset(h_la_, 0, 64);
+        else cudaGetLastError();
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
@@ -754,6 +816,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
+        if (la_stats_ || pf_on_) {   // the next layer's router on this layer's MoE input (STRATA_LOOKAHEAD_STATS/PREFETCH)
+            // predictions are kept per (predicted layer's parity, group): the prefetch of layer l + 1 still reads its
+            // own while layer l + 1 predicts l + 2
+            auto pred_of = [&](int64_t layer) { return la_ids_ + ((size_t) (layer & 1) * 2 + (size_t) grp) * (size_t) max_t_ * K; };
+            int32_t* pred = pred_of(l + 1);
+            if (la_stats_ && l > lb_) lookahead_stats(ids_ + tb * K, pred_of(l), n * (int) K, hits_.d_res + l * g.n_expert, m_la_, cs);
+            if (l + 1 < le_) {
+                const LayerView vn(wt, l + 1);
+                const WeightRef* wr = vn.get("ffn_gate_inp.weight");
+                if (wr != nullptr) {
+                    float* lg = la_logits_ + (size_t) grp * (size_t) max_t_ * g.n_expert;
+                    gemv_fp32_mmvf_multi(mixed_ + tb * N, N, wr->data, wform(wr, "ffn_gate_inp.weight"), lg, NE, N, NE, n, cs);
+                    native_router_top10_multi(lg, pred, la_w_ + ((size_t) ((l + 1) & 1) * 2 + (size_t) grp) * (size_t) max_t_ * K, n, cs);
+                }
+            }
+        }
         if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -838,13 +916,33 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                // STRATA_PREFETCH: the groups whose blob was prefetched during the previous layer are not fetched
+                const bool pf = pf_on_ && l > lb_;
+                const unsigned long long* fsrc = p_ptr2;
+                unsigned long long* hit = pf_hit_ + (size_t) grp * (size_t) capx;
+                if (pf) {
+                    const int par = (int) (l & 1);
+                    const size_t si = ((size_t) par * 2 + (size_t) grp) * kPfSlots;
+                    cudaStreamWaitEvent(s, ev_pf_[par][grp], 0);
+                    unsigned long long* sq = pf_srcq_ + (size_t) grp * (size_t) capx;
+                    if (pf_check_)
+                        cudaMemcpyAsync(pf_orig_ + (size_t) grp * (size_t) capx, p_ptr2, (size_t) capx * 8,
+                                        cudaMemcpyDeviceToDevice, s);
+                    prefetch_resolve(p_ptr2, p_counts + 2, pf_src_ + si, kPfSlots, pf_buf_ + si * (size_t) pf_slot_, pf_slot_,
+                                     sq, hit, s);
+                    fsrc = sq;
+                }
                 if (partner_ >= 0) {   // the even blobs here, the odd ones by the partner (set_partner)
-                    fetch_blobs_strided(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), 0, 2, s);
+                    fetch_blobs_strided(fsrc, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), 0, 2, s);
                     wait_and_clear(m_pdone_ + (ring - 1), s);
                 } else {
-                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, s);
+                    fetch_blobs(fsrc, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, s);
                 }
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), s);
+                if (pf) prefetch_rebase((unsigned long long*) p_ptr2, p_counts + 2, hit, s);
+                if (pf && pf_check_)
+                    prefetch_check(p_ptr2, hit, pf_orig_ + (size_t) grp * (size_t) capx, p_counts + 2,
+                                   (int64_t) lay.blob_bytes(l), (int) capx, m_pfc_, s);
             }
         };
         const bool overlap = fetch_overlap_ && sink_.pcie_mode == 2;
@@ -853,6 +951,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             cudaStreamWaitEvent(fetch_s_, ev_plan_, 0);
             fetch(fetch_s_);
             cudaEventRecord(ev_fetched_, fetch_s_);
+        }
+        // STRATA_PREFETCH: layer l + 1's predicted blobs, once layer l's own fetch has landed (the link is then free)
+        if (pf_on_ && overlap && l + 1 < le_) {
+            const int par = (int) ((l + 1) & 1);
+            const size_t si = ((size_t) par * 2 + (size_t) grp) * kPfSlots;
+            cudaEventRecord(ev_pred_, fetch_s_);   // after layer l's fetch (recorded on fetch_s_ above)
+            cudaStreamWaitEvent(pf_s_, ev_pred_, 0);
+            prefetch_blobs(la_ids_ + ((size_t) par * 2 + (size_t) grp) * (size_t) max_t_ * K, n * (int) K,
+                           hits_.d_res + (l + 1) * g.n_expert, alias_d_ + (l + 1) * g.n_expert, pf_src_ + si,
+                           pf_buf_ + si * (size_t) pf_slot_, (int64_t) lay.blob_bytes(l + 1), pf_slot_, kPfSlots, pf_s_);
+            cudaEventRecord(ev_pf_[par][grp], pf_s_);
         }
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
@@ -1239,6 +1348,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
+    if (pf_check_ && (la_windows_ + 1) % 100 == 0)
+        std::fprintf(stderr, "strata verify: PREFETCH_CHECK CUDA%d: %llu prefetched groups used, %llu with bytes that differ "
+                             "from the arena\n", device_, h_pfc_[0], h_pfc_[1]);
+    if (pf_check_ && !la_stats_) ++la_windows_;
+    if (la_stats_ && ++la_windows_ % 100 == 0) {
+        const unsigned long long* c = h_la_;
+        std::fprintf(stderr, "strata verify: LOOKAHEAD CUDA%d after %lld windows: %.1f%% of routed entries predicted; %llu "
+                             "distinct missed experts, %.1f%% predicted; %.2f predicted non-resident experts per missed one\n",
+                     device_, la_windows_, c[0] ? 100.0 * (double) c[1] / (double) c[0] : 0.0, c[2],
+                     c[2] ? 100.0 * (double) c[3] / (double) c[2] : 0.0, c[2] ? (double) c[4] / (double) c[2] : 0.0);
+    }
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);

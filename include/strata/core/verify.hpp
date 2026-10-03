@@ -144,6 +144,10 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
+    /// STRATA_PREFETCH=1: copy the next layer's predicted non-resident experts into VRAM during this layer (the next
+    /// layer's router on this layer's MoE input); the next layer's PCIe groups then use them in place of a fetch.
+    /// Bit-identical.  Needs the copy-kernel PCIe mode and arena aliases; false (with `why`) otherwise.
+    bool set_prefetch(const ExpertSource& src, std::string& why);
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
@@ -244,6 +248,22 @@ private:
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
+    bool la_stats_ = false;                    ///< STRATA_LOOKAHEAD_STATS=1: measure the next-layer router prediction
+    float *la_logits_ = nullptr, *la_w_ = nullptr;
+    int32_t* la_ids_ = nullptr;
+    unsigned long long *h_la_ = nullptr, *m_la_ = nullptr;
+    long long la_windows_ = 0;
+    static constexpr int kPfSlots = 10;
+    bool pf_on_ = false;
+    unsigned long long* alias_d_ = nullptr;     ///< [n_layers * n_expert] arena aliases
+    uint8_t* pf_buf_ = nullptr;                 ///< [2 layer parities][2 groups][kPfSlots] blobs
+    int64_t pf_slot_ = 0;                       ///< bytes per slot (the largest blob, 256-aligned)
+    unsigned long long* pf_src_ = nullptr;      ///< [2][2][kPfSlots] the slot's arena address (0: empty)
+    unsigned long long *pf_srcq_ = nullptr, *pf_hit_ = nullptr;   ///< [2 groups][capx]
+    cudaStream_t pf_s_ = nullptr;
+    cudaEvent_t ev_pred_ = nullptr, ev_pf_[2][2] = {};
+    bool pf_check_ = false;                     ///< STRATA_PREFETCH_CHECK=1
+    unsigned long long *pf_orig_ = nullptr, *h_pfc_ = nullptr, *m_pfc_ = nullptr;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);

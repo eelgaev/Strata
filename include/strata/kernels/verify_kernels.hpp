@@ -51,6 +51,22 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream);
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream);
+/// STRATA_PREFETCH: copy the predicted non-resident experts' arena blobs into `buf` (cap slots of `slot_bytes`).
+void prefetch_blobs(const int32_t* pred, int n, const int32_t* res_layer, const unsigned long long* alias_layer,
+                    unsigned long long* slot_src, uint8_t* buf, int64_t blob_bytes, int64_t slot_bytes, int cap,
+                    void* stream);
+/// STRATA_PREFETCH: the PCIe groups' blobs already prefetched: `srcq` (0 for them) for the fetch, `hit` for rebase.
+void prefetch_resolve(const unsigned long long* ptr2, const int32_t* n, const unsigned long long* slot_src, int cap,
+                      const uint8_t* buf, int64_t slot_bytes, unsigned long long* srcq, unsigned long long* hit,
+                      void* stream);
+/// STRATA_PREFETCH_CHECK: compare each prefetched group's blob at ptr2[q] with orig[q]; counters [checked, differ].
+void prefetch_check(const unsigned long long* ptr2, const unsigned long long* hit, const unsigned long long* orig,
+                    const int32_t* n, int64_t blob_bytes, int cap, unsigned long long* counters, void* stream);
+/// STRATA_PREFETCH: point the prefetched PCIe groups at their prefetch slots (after rebase_ptrs).
+void prefetch_rebase(unsigned long long* ptr2, const int32_t* n, const unsigned long long* hit, void* stream);
+/// STRATA_LOOKAHEAD_STATS: count how well `predicted` (top-10 per token) covers `actual`; mapped counters [5].
+void lookahead_stats(const int32_t* actual, const int32_t* predicted, int n, const int32_t* res_layer,
+                     unsigned long long* counters, void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.

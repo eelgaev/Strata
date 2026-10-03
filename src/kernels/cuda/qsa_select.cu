@@ -5,6 +5,10 @@
 #include "strata/kernels/qsa_select.hpp"
 
 #include <cuda_runtime.h>
+#if !defined(__HIPCC__)
+#include <cuda_fp16.h>
+#include <mma.h>
+#endif
 
 #include <cfloat>
 #include <cstdio>
@@ -434,6 +438,118 @@ bool sel_gfx12_device() {
 }
 #endif  // __HIPCC__
 
+#if !defined(__HIPCC__)
+// Volta (sm_70, STRATA_SELECT_VOLTA=1): the scores on FP16 tensor cores. Each FP32 value is split into hi = fp16(x)
+// and lo = fp16((x - hi) * 2^11); hi*hi + (hi*lo + lo*hi) / 2^11 (lo*lo dropped) is FP32-level (rms 1.0e-7 of the score
+// against FP64, the warp kernel 6e-8) but not bitwise. hi*hi goes through a fresh fragment per 16-dim step, added with
+// FP32 adds: Volta's tensor cores truncate when they accumulate. 16 queries per CTA share each key read.
+namespace wmma = nvcuda::wmma;
+constexpr int VQ = 16;                 // queries per CTA
+constexpr int VITER = 4;               // 16-block key tiles per warp
+constexpr int VQS = IDX_DIM + 8;       // halves per query row in LDS
+constexpr int VKS = 16 + 8;            // halves per key row of a warp's 16-dim slice
+constexpr float LO_SCALE = 2048.0f;    // the low parts are stored x 2^11 (no FP16 underflow); unscaled at the end
+using AccF = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+
+__device__ __forceinline__ void split16(float x, __half& hi, __half& lo) {
+    hi = __float2half_rn(x);
+    lo = __float2half_rn((x - __half2float(hi)) * LO_SCALE);
+}
+
+struct VSmem {
+    __half qh[IDX_HEADS][VQ][VQS], ql[IDX_HEADS][VQ][VQS];   // queries hi / lo, [head][query][dim]
+    __half kh[4][16][VKS], kl[4][16][VKS];                    // per warp: the key slice hi / lo
+    float ep[4][16][16 + 4];                                  // per warp: the epilogue tile [block][query]
+    int nbid[VQ];
+};
+
+__global__ void __launch_bounds__(128) scores_volta_kernel(const float* __restrict__ pooled, const float* __restrict__ q_idx,
+                                                           const int32_t* __restrict__ steps, int64_t nq, int64_t max_blocks,
+                                                           int64_t reach, float* __restrict__ out) {
+    extern __shared__ __align__(16) unsigned char smraw[];
+    VSmem& S = *reinterpret_cast<VSmem*>(smraw);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int64_t q0 = (int64_t) blockIdx.y * VQ;
+    for (int i = t; i < VQ * IDX_HEADS * IDX_DIM / 4; i += 128) {
+        const int row = i / (IDX_DIM / 4), c = i % (IDX_DIM / 4);
+        const int qr = row / IDX_HEADS, h = row % IDX_HEADS;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (q0 + qr < nq) v = reinterpret_cast<const float4*>(q_idx + (q0 + qr) * IDX_HEADS * IDX_DIM)[h * (IDX_DIM / 4) + c];
+        const float x[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) split16(x[j], S.qh[h][qr][c * 4 + j], S.ql[h][qr][c * 4 + j]);
+    }
+    if (t < VQ) S.nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : 0;
+    __syncthreads();
+    int hi_nbid = 0;
+#pragma unroll
+    for (int i = 0; i < VQ; ++i) hi_nbid = max(hi_nbid, S.nbid[i]);
+    for (int it = 0; it < VITER; ++it) {
+        const int64_t b0 = (((int64_t) blockIdx.x * VITER + it) * 4 + warp) * 16;
+        if (b0 >= reach || b0 >= hi_nbid) break;   // warp-uniform
+        // this lane's share of the key slice: row lane/2, 8 dims at (lane%2)*8
+        const int kr = lane >> 1, kc = (lane & 1) * 8;
+        const int64_t row = b0 + kr;
+        const bool rv = row < hi_nbid && row < max_blocks;
+        const float* kp = pooled + (rv ? row : 0) * IDX_DIM + kc;
+        AccF acc[IDX_HEADS], cor[IDX_HEADS];
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h) { wmma::fill_fragment(acc[h], 0.f); wmma::fill_fragment(cor[h], 0.f); }
+        float4 n0 = rv ? *reinterpret_cast<const float4*>(kp) : make_float4(0.f, 0.f, 0.f, 0.f);
+        float4 n1 = rv ? *reinterpret_cast<const float4*>(kp + 4) : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll 1
+        for (int kk = 0; kk < IDX_DIM / 16; ++kk) {
+            const float x[8] = {n0.x, n0.y, n0.z, n0.w, n1.x, n1.y, n1.z, n1.w};
+            __syncwarp();
+#pragma unroll
+            for (int j = 0; j < 8; ++j) split16(x[j], S.kh[warp][kr][kc + j], S.kl[warp][kr][kc + j]);
+            __syncwarp();
+            if (kk + 1 < IDX_DIM / 16 && rv) {   // the next slice's loads behind this slice's products
+                n0 = *reinterpret_cast<const float4*>(kp + (kk + 1) * 16);
+                n1 = *reinterpret_cast<const float4*>(kp + (kk + 1) * 16 + 4);
+            }
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> Ah, Al;
+            wmma::load_matrix_sync(Ah, &S.kh[warp][0][0], VKS);
+            wmma::load_matrix_sync(Al, &S.kl[warp][0][0], VKS);
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> Bh, Bl;
+                wmma::load_matrix_sync(Bh, &S.qh[h][0][kk * 16], VQS);
+                wmma::load_matrix_sync(Bl, &S.ql[h][0][kk * 16], VQS);
+                // hi*hi in a fresh fragment, added with FP32 adds (the tensor cores truncate when accumulating)
+                AccF st;
+                wmma::fill_fragment(st, 0.f);
+                wmma::mma_sync(st, Ah, Bh, st);
+#pragma unroll
+                for (int e = 0; e < st.num_elements; ++e) acc[h].x[e] += st.x[e];
+                wmma::mma_sync(cor[h], Ah, Bl, cor[h]);
+                wmma::mma_sync(cor[h], Al, Bh, cor[h]);
+            }
+        }
+        // relu per head, heads added in order; then masked write [query][block]
+        AccF sc;
+#pragma unroll
+        for (int e = 0; e < sc.num_elements; ++e) {
+            float s = 0.f;
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float d = acc[h].x[e] + cor[h].x[e] * (1.0f / LO_SCALE);
+                s += d > 0.f ? d : 0.f;
+            }
+            sc.x[e] = s;
+        }
+        wmma::store_matrix_sync(&S.ep[warp][0][0], sc, 16 + 4, wmma::mem_row_major);   // [block][query]
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int i = lane + 32 * j, qr = i / 16, br = i % 16;
+            const int64_t b = b0 + br;
+            if (q0 + qr < nq && b < S.nbid[qr] && b < max_blocks) out[(q0 + qr) * max_blocks + b] = S.ep[warp][br][qr];
+        }
+    }
+}
+#endif
+
 // the tail block n_bid of each query: exactly block_scores_kernel's arithmetic for that block
 __global__ void __launch_bounds__(32) block_scores_tail_kernel(const float* __restrict__ dead,
                                                                const float* __restrict__ q_idx,
@@ -706,6 +822,31 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
             // STRATA_QSA_WARP=1|select (an A/B arm): the pre-sm_80 kernels on any card, as RTX 20 runs them
             const char* w = std::getenv("STRATA_QSA_WARP");
             cc_major[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "select")) ? 7 : strata::cc_major_of(major);
+        }
+        if (cc_major[dev] == 7) {
+            static const bool volta_on = [] {
+                const char* v = std::getenv("STRATA_SELECT_VOLTA");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            if (!volta_on || nq > 65535 * VQ) return false;
+            static bool vattr[64] = {};
+            if (!vattr[dev]) {
+                if (cudaFuncSetAttribute(scores_volta_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         (int) sizeof(VSmem)) != cudaSuccess) {
+                    cudaGetLastError();
+                    return false;
+                }
+                vattr[dev] = true;
+            }
+            const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+            const int64_t per = (int64_t) 4 * VITER * 16;
+            const dim3 grid((unsigned) ((reach + per - 1) / per), (unsigned) ((nq + VQ - 1) / VQ));
+            scores_volta_kernel<<<grid, 128, sizeof(VSmem), (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks,
+                                                                                    reach, scores);
+            block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc (volta): %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return true;
         }
         if (cc_major[dev] < 8) return false;
     }

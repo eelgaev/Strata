@@ -157,12 +157,21 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, const float*
 }  // namespace
 
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
+bool shared_expert_native_bf16() { return native_bf16; }
 
 namespace {
 __global__ void scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[(size_t) t * n + i] *= g[t];
+}
+// native_scalar_sigmoid_multi_kernel + scale_rows_kernel in one launch: every thread computes the gate with the same
+// expression (bitwise the same value); `g` keeps the raw logit (nothing reads it after this)
+__global__ void sigmoid_scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const float s = __fdividef(1.0f, 1.0f + __expf(-g[t]));
+    if (i < n) out[(size_t) t * n + i] *= s;
 }
 }  // namespace
 
@@ -184,7 +193,11 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), one sigmoid launch
         gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, gate_inp_form, g, 1, n_embd, 1, n_tok, stream);
-        native_scalar_sigmoid_multi_kernel<<<1, n_tok, 0, cs>>>(g);
+        sigmoid_scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok), THREADS, 0, cs>>>(
+            out, g, (int) n_embd);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));
+        return;
     } else
     for (int t = 0; t < n_tok; ++t) {
         if (native_bf16) {

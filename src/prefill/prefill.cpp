@@ -11,6 +11,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
+#include "strata/kernels/fused_expert.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -1708,6 +1709,39 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     } else {
                         gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                     }
+                    // STRATA_FUSED_EXPERTS=1: a native layer of Q4_K gate/up and Q5_1 / Q8_0 down runs its experts in
+                    // groups through fused_expert_run (no FP16 copy of the expert, one launch pair per group). A group
+                    // holds its experts' ring slots until it is issued: their `used` events are recorded then, a slot
+                    // it holds is flushed before stage_one refills it, and the streamed walk gives back no entry at or
+                    // after the group's first one (so the issuer never waits on an event that is not queued yet).
+                    static const bool fused_env = [] { const char* v = std::getenv("STRATA_FUSED_EXPERTS"); return v && v[0] && v[0] != '0'; }();
+                    strata::kernels::FusedExpertLayout fl;
+                    bool fused = false;
+                    if (fused_env && !use_mmq && lay.native) {
+                        const auto& f = lay.fmt[(size_t) l];
+                        fused = strata::kernels::fused_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                        if (fused) {
+                            const auto nl = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                            fl.gu_type = f.gu_type; fl.d_type = f.d_type; fl.n_embd = f.n_embd; fl.n_ff = f.n_ff;
+                            fl.gu_row = nl.gu_row; fl.d_row = nl.d_row; fl.up_off = nl.up_off; fl.down_off = nl.down_off;
+                        }
+                    }
+                    strata::kernels::FusedExpertGroup fg;
+                    int fg_slot[strata::kernels::kFusedExpertMax] = {};
+                    size_t fg_k0 = SIZE_MAX;   // the streamed walk: the group's first ring entry
+                    auto fg_flush = [&]() {
+                        if (fg.n == 0) return;
+                        pt.mark(kPfGemmGU, cs);
+                        strata::kernels::fused_expert_run(fl, fg, m.Xs, m.Hh, m.Dm, m.cs);
+                        for (int i = 0; i < fg.n; ++i) if (fg_slot[i] >= 0) cudaEventRecord(m.used[fg_slot[i]], m.cs);
+                        fg.n = 0;
+                        if (fg_k0 != SIZE_MAX) { fg_k0 = SIZE_MAX; give_back(consumed); }
+                    };
+                    auto fg_holds = [&](int sl) {
+                        for (int i = 0; i < fg.n; ++i) if (fg_slot[i] == sl) return true;
+                        return false;
+                    };
+                    auto give = [&](size_t c) { give_back(fg_k0 != SIZE_MAX ? std::min(c, fg_k0) : c); };
                     // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                     int stage_next = 0;
                     std::vector<int> stage_of(order.size(), -1);
@@ -1737,6 +1771,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (resident) return true;
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
+                        if (fused && fg_holds(sl)) fg_flush();
                         const auto th = Clock::now();
                         const bool pinned = m.src->pinned(l, e);   // pinned: never transient
                         const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
@@ -1764,6 +1799,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // expert) is released once the blob is read
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                         const int32_t e = order[j];
+                        if (fused) {
+                            fg.blob[fg.n] = blob_dev; fg.row0[fg.n] = m.off[(size_t) e]; fg.ne[fg.n] = (int) m.cnt[(size_t) e];
+                            fg_slot[fg.n] = slot;
+                            if (++fg.n == strata::kernels::kFusedExpertMax || j + 1 == order.size()) fg_flush();
+                            return true;
+                        }
                         pt.mark(kPfDequant, cs);
                         if (use_mmq) {
                             // gather the expert into its group slot (GGUF blocks, unchanged or converted)
@@ -1849,7 +1890,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             while (k < kend && seq[k].e < e_stop) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 consumed = ++k;
-                                give_back(consumed);
+                                give(consumed);
                             }
                         };
                         for (size_t j = 0; j < order.size(); ++j) {
@@ -1857,12 +1898,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             release_to(e);
                             if (k < kend && seq[k].e == e) {
                                 const int sl = (int) (k % (size_t) m.ring);
+                                if (fused && fg_k0 != SIZE_MAX && k >= fg_k0 + (size_t) m.ring) fg_flush();
+                                if (fused && fg_k0 == SIZE_MAX) fg_k0 = k;
                                 pt.mark(kPfWaitCopy, cs);
                                 wait_issued(k);
                                 cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
                                 if (!compute(j, m.stage_dev[sl], sl)) return false;
                                 consumed = ++k;
-                                give_back(consumed);
+                                give(consumed);
                             } else {
                                 ++stats_.experts_resident;
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;

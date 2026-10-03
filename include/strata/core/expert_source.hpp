@@ -207,6 +207,9 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// STRATA_GPU_PLAN=1: the GPU plans every group itself (verify window graph) and computes every expert; the host
+    /// pool only keeps the statistics and must not publish a plan or compute a CPU share.
+    bool gpu_plans = false;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).

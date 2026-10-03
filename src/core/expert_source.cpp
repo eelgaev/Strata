@@ -1760,6 +1760,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    if (d.plan != nullptr && d.plan->gpu_plans) {
+        // STRATA_GPU_PLAN: the window graph planned this layer on the GPU and computes every routed expert there
+        // (resident from the cache, the others from the pinned arena); the host keeps the statistics only
+        const int64_t n = n_tok * k;
+        for (int64_t i = 0; i < n; ++i) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= d.n_expert) continue;
+            bool first = true;
+            for (int64_t j = 0; j < i; ++j) if (ids[j] == e) { first = false; break; }
+            if (d.host_res != nullptr && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ++d.cache_hits;
+            else if (first) ++d.pcie_experts;
+        }
+        ++d.layers;
+        d.experts += n;
+        return;
+    }
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;

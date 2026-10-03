@@ -616,6 +616,119 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     __threadfence();
     *skip = ring;
 }
+// STRATA_GPU_PLAN: the host's plan (expert_pool_dispatch_multi with every miss on the GPU, pcie_num 256) built on the
+// device: distinct experts in routing order, resident ones as VRAM groups, then up to `stage_cap` missed ones as PCIe
+// groups (their arena alias, staged by the fetch kernel); a miss past the cap (the host's CPU share) becomes a VRAM
+// group read straight from the arena.  Written to the device plan, copied to the mapped plan for a partner GPU, then
+// flag A raised.  Thread 0 plans, the block copies.
+// block-wide exclusive prefix sum of v over 128 threads (4 warps); returns this thread's prefix, *total the sum
+__device__ __forceinline__ int plan_scan(int v, int* sh, int* total) {
+    const int t = threadIdx.x, lane = t & 31, w = t >> 5;
+    int x = v;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }
+    if (lane == 31) sh[w] = x;
+    __syncthreads();
+    int base = 0;
+    for (int k = 0; k < w; ++k) base += sh[k];
+    const int tot = sh[0] + sh[1] + sh[2] + sh[3];
+    __syncthreads();
+    *total = tot;
+    return base + x - v;
+}
+__global__ void __launch_bounds__(128) gpu_plan_kernel(const int32_t* __restrict__ ids, int n, int k,
+                                                       const int32_t* __restrict__ res, int n_expert,
+                                                       const uint8_t* cache_base, const unsigned long long* slot_off,
+                                                       long long blob, const unsigned long long* __restrict__ alias,
+                                                       int stage_cap, int32_t* pl, int32_t* mpl, int plan_i32,
+                                                       long long capx, uint32_t* flagA, uint32_t ring) {
+    // thread i = routing entry i (n <= 128).  The host loop's plan, built in parallel: entry i belongs to the group of
+    // its expert's first entry f; groups are distinct experts in routing order, the resident (and past-the-staging)
+    // ones first, then the PCIe ones; a group's entries are its expert's entries in routing order.
+    __shared__ int32_t sid[128];
+    __shared__ int sfirst[128], sgroup_start[128], sh[4];
+    const int i = threadIdx.x;
+    sid[i] = i < n ? ids[i] : -1;
+    __syncthreads();
+    const int32_t e = sid[i];
+    int first = i, rank = 0, cnt = 0;   // rank: my position among my expert's entries; cnt: its entries (first only)
+    if (i < n) {
+        for (int j = 0; j < i; ++j) if (sid[j] == e) { if (first == i) first = j; ++rank; }
+        if (first == i) for (int j = i; j < n; ++j) cnt += sid[j] == e;
+    }
+    sfirst[i] = first;
+    const bool lead = i < n && first == i && e >= 0 && e < n_expert;
+    const int32_t slot = lead ? res[e] : -1;
+    const bool miss = lead && slot < 0;
+    // the misses, in routing order: the first stage_cap (and < 64) with an arena alias are PCIe groups
+    int tot_miss = 0;
+    const int miss_rank = plan_scan(miss && alias[e] != 0ull ? 1 : 0, sh, &tot_miss);
+    const int cap = stage_cap < 64 ? stage_cap : 64;
+    const bool pcie = miss && alias[e] != 0ull && miss_rank < cap;
+    const bool vram = lead && !pcie;   // resident, or a miss past the staging (read from the arena)
+    int groups = 0, fetches = 0, vram_entries = 0, all_entries = 0;
+    const int g = plan_scan(vram ? 1 : 0, sh, &groups);
+    const int q = plan_scan(pcie ? 1 : 0, sh, &fetches);
+    const int ve = plan_scan(vram ? cnt : 0, sh, &vram_entries);
+    const int pe = plan_scan(pcie ? cnt : 0, sh, &all_entries);
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    unsigned long long* ptr2 = ptr + capx;
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    if (vram) {
+        ptr[g] = slot >= 0 ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
+                           : alias[e];
+        start[g] = ve;
+    }
+    if (pcie) { ptr2[q] = alias[e]; start2[q] = vram_entries + pe; }
+    sgroup_start[i] = vram ? ve : pcie ? vram_entries + pe : 0;
+    __syncthreads();
+    if (i < n && e >= 0 && e < n_expert) {
+        const int at = sgroup_start[sfirst[i]] + rank;
+        dst[at] = i;
+        tok[at] = i / k;
+    }
+    if (i == 0) {
+        start[groups] = vram_entries;
+        start2[fetches] = vram_entries + all_entries;
+        counts[0] = groups;
+        counts[1] = vram_entries + all_entries;
+        counts[2] = fetches;
+    }
+    __threadfence();
+    __syncthreads();
+    if (mpl != nullptr)
+        for (int i = threadIdx.x; i < plan_i32; i += blockDim.x) mpl[i] = ((volatile int32_t*) pl)[i];
+    __syncthreads();
+    if (threadIdx.x == 0 && flagA != nullptr) {
+        __threadfence_system();
+        *(volatile uint32_t*) flagA = ring;
+    }
+}
+// STRATA_GPU_PLAN_CHECK: the used fields of plan a (the host's) and b (the device's); out[0] += mismatching layers,
+// out[1] = the first mismatch's field index, out[2]/out[3] its two values (low 32 bits), out[4] = its ring
+__global__ void plan_compare_kernel(const int32_t* a, const int32_t* b, long long capx, uint32_t* out, uint32_t ring) {
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    const int g = a[0], ent = a[1], f = a[2];
+    long long bad = -1;
+    uint32_t va = 0, vb = 0;
+    auto chk = [&](long long i) { if (bad < 0 && a[i] != b[i]) { bad = i; va = (uint32_t) a[i]; vb = (uint32_t) b[i]; } };
+    for (int i = 0; i < 3; ++i) chk(i);
+    for (int i = 0; i <= g; ++i) chk(4 + i);
+    for (int i = 0; i < ent; ++i) { chk(4 + capx + 1 + i); chk(4 + capx + 1 + capx + i); }
+    for (int i = 0; i < 2 * g; ++i) chk(ptr_off + i);
+    for (int i = 0; i < 2 * f; ++i) chk(ptr_off + 2 * capx + i);
+    for (int i = 0; i <= f; ++i) chk(ptr_off + 4 * capx + i);
+    if (bad >= 0) {
+        if (out[0] == 0) { out[1] = (uint32_t) bad; out[2] = va; out[3] = vb; out[4] = ring; out[5] = (uint32_t) a[2]; out[6] = (uint32_t) b[2]; out[7] = (uint32_t) a[1]; out[8] = (uint32_t) b[1]; }
+        out[0] += 1;
+    }
+    __threadfence_system();
+}
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
     while (*flag < value) strata_spin_pause();
@@ -640,6 +753,21 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
                                                              blob, plan, capx, skip, ring);
     check("resident_plan");
+}
+void gpu_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert, const uint8_t* cache_base,
+              const unsigned long long* slot_off, long long blob, const unsigned long long* alias_layer, int stage_cap,
+              int32_t* plan, int32_t* mapped_plan, int plan_i32, long long capx, uint32_t* flagA, uint32_t ring,
+              void* stream) {
+    if (n_entries > 128 || n_entries < 1) { std::fprintf(stderr, "gpu_plan: %d entries\n", n_entries); std::exit(1); }
+    gpu_plan_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
+                                                          blob, alias_layer, stage_cap, plan, mapped_plan, plan_i32, capx,
+                                                          flagA, ring);
+    check("gpu_plan");
+}
+void plan_compare(const int32_t* host_plan, const int32_t* dev_plan, long long capx, uint32_t* out, uint32_t ring,
+                  void* stream) {
+    plan_compare_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(host_plan, dev_plan, capx, out, ring);
+    check("plan_compare");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);

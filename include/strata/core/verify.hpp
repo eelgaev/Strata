@@ -144,6 +144,10 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
+    /// STRATA_GPU_PLAN=1: plan every layer on the GPU (no per-layer host wait).  Needs the copy-kernel PCIe mode, every
+    /// missed expert computed by the GPU (pcie_frac 1) and a device alias for every expert of this verifier's layers;
+    /// returns false (and leaves the host plan) otherwise.  Before the first window.
+    bool set_gpu_plan(const ExpertSource& src, std::string& why);
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
@@ -244,6 +248,11 @@ private:
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
+    bool gpu_plan_ = false;
+    bool gpu_plan_check_ = false;             ///< STRATA_GPU_PLAN_CHECK=1: the host plans, the device plan is compared
+    int32_t* chk_plan_ = nullptr;
+    uint32_t *h_chk_ = nullptr, *m_chk_ = nullptr;
+    unsigned long long* alias_d_ = nullptr;   ///< STRATA_GPU_PLAN: [n_layers * n_expert] arena aliases (0: none)
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);

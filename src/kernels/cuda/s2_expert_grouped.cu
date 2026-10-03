@@ -671,6 +671,15 @@ __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restri
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
         parts[row + i] += hit_out[row + i];
 }
+// STRATA_GPU_PLAN: every row is a GPU row - the value copy_rows_from_mapped (zero) + add_hits_kernel produced
+__global__ void set_hits_kernel(float* __restrict__ parts, const float* __restrict__ hit_out,
+                                const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int n_embd) {
+    const int h = blockIdx.y;
+    if (h >= *count) return;
+    const size_t row = (size_t) dst[h] * (size_t) n_embd;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
+        parts[row + i] = 0.0f + hit_out[row + i];
+}
 }  // namespace
 
 void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_expert, int32_t* slot, int32_t* dst,
@@ -1141,6 +1150,13 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
     const dim3 grid((unsigned) ((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8), (unsigned) cap);
     add_hits_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
     check("moe_hit_add", stream);
+}
+void moe_hit_set(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
+                 int64_t n_embd, void* stream) {
+    if (cap <= 0) return;
+    const dim3 grid((unsigned) ((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8), (unsigned) cap);
+    set_hits_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
+    check("moe_hit_set", stream);
 }
 
 void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_index,

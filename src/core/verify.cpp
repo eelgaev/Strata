@@ -135,6 +135,41 @@ const int64_t g_test_stall = [] {
 }();
 }  // namespace
 
+bool Verifier::set_gpu_plan(const ExpertSource& src, std::string& why) {
+    const OnDevice on_device(device_);
+    if (sink_.pcie_mode != 2) { why = "the PCIe mode is not the copy kernel"; return false; }
+    if (hits_.d_res == nullptr || hits_.cache_base == nullptr) { why = "no device residency table"; return false; }
+    if ((int64_t) max_t_ * 10 > 128) { why = "a window has more than 128 entries"; return false; }
+    const int64_t NE = g_->n_expert;
+    std::vector<unsigned long long> a((size_t) (g_->n_layers * NE), 0ull);
+    for (int64_t l = lb_; l < le_; ++l)
+        for (int64_t e = 0; e < NE; ++e) {
+            const uint8_t* p = src.pinned(l, e) ? src.device_alias(l, e) : nullptr;
+            if (p == nullptr) { why = "layer " + std::to_string(l) + " expert " + std::to_string(e) + " has no arena alias"; return false; }
+            a[(size_t) (l * NE + e)] = (unsigned long long) p;
+        }
+    bool ok = cudaMalloc((void**) &alias_d_, a.size() * sizeof(unsigned long long)) == cudaSuccess &&
+              cudaMemcpy(alias_d_, a.data(), a.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok && slot_off_d_ == nullptr && hits_.slot_off != nullptr && hits_.n_slots > 0)
+        ok = cudaMalloc((void**) &slot_off_d_, (size_t) hits_.n_slots * sizeof(unsigned long long)) == cudaSuccess &&
+             cudaMemcpy(slot_off_d_, hits_.slot_off, (size_t) hits_.n_slots * sizeof(unsigned long long),
+                        cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!ok) { cudaGetLastError(); why = "device tables"; return false; }
+    if (const char* c = std::getenv("STRATA_GPU_PLAN_CHECK"); c != nullptr && c[0] == '1') {
+        if (cudaMalloc((void**) &chk_plan_, (size_t) 2 * (size_t) (plan_i32_ + 16) * 4) != cudaSuccess ||
+            cudaHostAlloc((void**) &h_chk_, 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &m_chk_, h_chk_, 0) != cudaSuccess) {
+            cudaGetLastError(); why = "check buffers"; return false;
+        }
+        std::memset(h_chk_, 0, 64);
+        gpu_plan_check_ = true;   // the host keeps planning; the device plan is only compared
+        return true;
+    }
+    gpu_plan_ = true;
+    sink_.gpu_plans = true;
+    return true;
+}
+
 bool Verifier::set_partner(int dev, std::string& err) {
     (void) err;
     if (const char* v = std::getenv("STRATA_FETCH_PARTNER"); v != nullptr && std::atoi(v) == 0) return true;
@@ -754,7 +789,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+        if (gpu_plan_check_) {
+            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+            gpu_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert, hits_.cache_base,
+                     slot_off_d_, (long long) hits_.blob, alias_d_ + l * g.n_expert, (int) per,
+                     chk_plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), nullptr, (int) plan_i32_,
+                     (long long) max_t_ * K, nullptr, 0u, cs);
+        }
+        if (gpu_plan_) {   // STRATA_GPU_PLAN: the whole plan here, published for a partner, flag A raised
+            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+            gpu_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert, hits_.cache_base,
+                     slot_off_d_, (long long) hits_.blob, alias_d_ + l * g.n_expert, (int) per,
+                     plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), m_plan_ + (size_t) grp * (size_t) plan_i32_,
+                     (int) plan_i32_, (long long) max_t_ * K, m_flagA_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
+        } else if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
@@ -801,12 +849,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-        if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+        if (gpu_plan_) {
+            // STRATA_GPU_PLAN: planned in pre() on this stream
+        } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
             wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
         } else {
             wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
             copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+            if (gpu_plan_check_)
+                plan_compare(pl, chk_plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), capx, m_chk_, ring, cs);
         }
         stamp(l, 19, grp);
         const int32_t* p_counts = pl;
@@ -833,7 +885,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         auto fetch = [&](cudaStream_t s) {
-            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, s);
+            if (gpu_plan_) {}   // the plan is on the device already: nothing to wait for
+            else if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, s);
             else wait_flag_ge(m_flagB_, ring, s);              // the PCIe share is in staging (DMA) or mapped
             if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
@@ -861,7 +914,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 21, grp);
         grouped(p_ptr2, p_start2, p_counts + 2);
         stamp(l, 22, grp);
-        if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+        if (gpu_plan_) {
+            // STRATA_GPU_PLAN: no CPU share - every row of parts_ was written by a GPU group
+        } else if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
@@ -874,7 +929,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else
                 copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
         }
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        if (gpu_plan_) moe_hit_set(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        else moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
                 native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
@@ -1216,7 +1272,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         strata_store_fence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+        if (!gpu_plan_ && *(volatile uint32_t*) h_flagA_ != want) {   // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
@@ -1238,6 +1294,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // beside the expert workers).
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (gpu_plan_check_ && h_chk_[0] != 0) {
+        static int told = 0;
+        if (told++ < 20)
+            std::fprintf(stderr, "strata verify: GPU_PLAN_CHECK CUDA%d: %u mismatching plans; first at field %u (host %d, "
+                                 "device %d), step %u; PCIe groups host %u device %u; entries host %u device %u\n", device_, h_chk_[0],
+                         h_chk_[1], (int) h_chk_[2], (int) h_chk_[3], h_chk_[4], h_chk_[5], h_chk_[6], h_chk_[7], h_chk_[8]);
+        h_chk_[0] = 0;
+    }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps

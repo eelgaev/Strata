@@ -90,6 +90,9 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                             void* scratch, float* out, void* stream, const float* x_scales);
 void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
                  int64_t n_embd, void* stream);
+/// moe_hit_add when every row is a GPU row (STRATA_GPU_PLAN): parts[row] = 0 + hit_out[row], no prior zeroing.
+void moe_hit_set(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
+                 int64_t n_embd, void* stream);
 /// Plan v0.3 P6 verify window: `moe_hit_select` over `n` <= 128 routed entries (T tokens x k, flattened), and the
 /// hit kernel with one activation PER TOKEN - entry `dst` reads token `dst / k_per_token`'s rows of `x_q8_0`
 /// ((n_embd/32)*34 bytes each) and `x_scales` (n_embd/32 floats each).  Per hit, bitwise `moe_hit_grouped_s2_dev`.

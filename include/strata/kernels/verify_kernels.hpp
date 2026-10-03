@@ -51,6 +51,15 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream);
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream);
+/// STRATA_GPU_PLAN: the window's expert plan for one layer and token group on the device (the host's plan with every
+/// miss on the GPU), copied to `mapped_plan` and flag A raised to `ring` for a partner GPU.
+void gpu_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert, const uint8_t* cache_base,
+              const unsigned long long* slot_off, long long blob, const unsigned long long* alias_layer, int stage_cap,
+              int32_t* plan, int32_t* mapped_plan, int plan_i32, long long capx, uint32_t* flagA, uint32_t ring,
+              void* stream);
+/// STRATA_GPU_PLAN_CHECK: compare a host plan with a device plan (used fields); mismatches counted into out[0..4].
+void plan_compare(const int32_t* host_plan, const int32_t* dev_plan, long long capx, uint32_t* out, uint32_t ring,
+                  void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
